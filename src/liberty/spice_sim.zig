@@ -26,7 +26,6 @@ const TimingType = types.TimingType;
 const PgPin = types.PgPin;
 const PgPinType = types.PgPinType;
 const NldmTable = types.NldmTable;
-const NLDM_SIZE = types.NLDM_SIZE;
 
 // ─── Port classification ────────────────────────────────────────────────────
 
@@ -265,7 +264,7 @@ pub const SimContext = struct {
             errdefer powers.deinit();
 
             for (inputs.items) |inp| {
-                var result = try self.measureTimingArc(inp, outp);
+                var result = try self.measureTimingArc(allocator, inp, outp);
                 result.arc.related_power_pin = pwr_pin_name;
                 result.arc.related_ground_pin = gnd_pin_name;
                 result.power.related_pg_pin = pwr_pin_name;
@@ -277,7 +276,7 @@ pub const SimContext = struct {
                 .name = outp,
                 .direction = .output,
                 .capacitance = 0.0,
-                .max_capacitance = self.config.load_indices[NLDM_SIZE - 1],
+                .max_capacitance = self.config.load_indices[self.config.load_indices.len - 1],
                 .timing_arcs = try arcs.toOwnedSlice(),
                 .internal_power = try powers.toOwnedSlice(),
             });
@@ -396,32 +395,46 @@ pub const SimContext = struct {
         };
     }
 
-    /// Sweep 7×7 (slew × load) to produce NLDM timing tables.
-    fn measureTimingArc(self: *SimContext, input_pin: []const u8, output_pin: []const u8) !TimingResult {
+    /// Sweep slew × load to produce NLDM timing tables.
+    fn measureTimingArc(self: *SimContext, allocator: std.mem.Allocator, input_pin: []const u8, output_pin: []const u8) !TimingResult {
+        const slew_count = self.config.slew_indices.len;
+        const load_count = self.config.load_indices.len;
+
         var arc = TimingArc{
             .related_pin = input_pin,
             .timing_sense = .non_unate, // conservative default for analog
             .timing_type = .combinational,
-            .cell_rise = undefined,
-            .cell_fall = undefined,
-            .rise_transition = undefined,
-            .fall_transition = undefined,
+            .cell_rise = try NldmTable.init(allocator, slew_count, load_count),
+            .cell_fall = try NldmTable.init(allocator, slew_count, load_count),
+            .rise_transition = try NldmTable.init(allocator, slew_count, load_count),
+            .fall_transition = try NldmTable.init(allocator, slew_count, load_count),
         };
+        errdefer {
+            arc.cell_rise.deinit(allocator);
+            arc.cell_fall.deinit(allocator);
+            arc.rise_transition.deinit(allocator);
+            arc.fall_transition.deinit(allocator);
+        }
+
         var pwr = InternalPower{
             .related_pin = input_pin,
-            .rise_power = undefined,
-            .fall_power = undefined,
+            .rise_power = try NldmTable.init(allocator, slew_count, load_count),
+            .fall_power = try NldmTable.init(allocator, slew_count, load_count),
         };
+        errdefer {
+            pwr.rise_power.deinit(allocator);
+            pwr.fall_power.deinit(allocator);
+        }
 
         for (self.config.slew_indices, 0..) |slew, si| {
             for (self.config.load_indices, 0..) |load, li| {
                 const pt = try self.measureSinglePoint(input_pin, output_pin, slew, load);
-                arc.cell_rise.values[si][li] = pt.tpd_rise_ns;
-                arc.cell_fall.values[si][li] = pt.tpd_fall_ns;
-                arc.rise_transition.values[si][li] = pt.t_rise_ns;
-                arc.fall_transition.values[si][li] = pt.t_fall_ns;
-                pwr.rise_power.values[si][li] = pt.rise_pj;
-                pwr.fall_power.values[si][li] = pt.fall_pj;
+                arc.cell_rise.set(si, li, pt.tpd_rise_ns);
+                arc.cell_fall.set(si, li, pt.tpd_fall_ns);
+                arc.rise_transition.set(si, li, pt.t_rise_ns);
+                arc.fall_transition.set(si, li, pt.t_fall_ns);
+                pwr.rise_power.set(si, li, pt.rise_pj);
+                pwr.fall_power.set(si, li, pt.fall_pj);
             }
         }
 
