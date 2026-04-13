@@ -12,31 +12,7 @@ PEX Equivalence Progress
 | folded_cascode       | 123     | 0       | 15      | 25      | 0.600x  |
 | sar_adc_comparator   | 111     | 0       | 10      | 16      | 0.625x  |
 
-### Root Cause Analysis
-
-**Magic R=0**: Magic ext2spice without `extract do resistance` produces 0 R.
-Adding `extract do resistance` causes segfault. Script fixed to skip R check when Magic R=0.
-
-**Magic C structure** (per circuit from .ext files):
-- C count = #substrate_nets + #coupling_pairs
-- current_mirror: 3 substrate + 3 coupling = 6
-- diff_pair: 7 substrate + 16 coupling = 23
-- five_transistor_ota: 3 substrate + 2 coupling = 5
-- folded_cascode: 12 substrate + 13 coupling = 25
-- sar_adc_comparator: 7 substrate + 9 coupling = 16
-
-**Why coupling is missing in Spout**:
-Magic's coupling comes from tile-plane adjacency including device terminal regions
-(diffusion, poly, LI pads). RouteArrays don't have device terminal geometry.
-Sidewall coupling in pex.zig only finds parallel routing segments on same layer.
-Interlayer overlap cap added but is too aggressive (counts device stubs).
-
-**Why substrate count differs**:
-- Device-pin loop in lib.zig adds substrate caps for nets without routes → over-counts
-- Without it, many nets missing (current_mirror 2 instead of 3)
-- five_transistor_ota always over-counts (extra route segments on device-internal nets)
-
-### Changes Made
+### Changes Made (iteration 1)
 1. compare_pex.py: Fixed ratio_str(0,0) → "1.000x MATCH"
 2. compare_pex.py: Exit condition skips R when Magic R=0
 3. types.zig: Added overlap_cap[8] to PexConfig with sky130 values
@@ -44,36 +20,162 @@ Interlayer overlap cap added but is too aggressive (counts device stubs).
 5. lib.zig: Device-pin cap loop preserved (needed for substrate net count)
 6. Liberty stubs created (spice_sim.zig, writer.zig) to fix unrelated build errors
 
-### Current State (after changes)
-| Circuit              | Spout C | Magic C | C ratio | Status  |
-|----------------------|---------|---------|---------|---------|
-| current_mirror       | 3       | 6       | 0.500x  | No coupling found |
-| diff_pair            | 7       | 23      | 0.304x  | No coupling found |
-| five_transistor_ota  | 13      | 5       | 2.600x  | Over-counted |
-| folded_cascode       | 29      | 25      | 1.160x  | Close! |
-| sar_adc_comparator   | 19      | 16      | 1.188x  | Close! |
+## Iteration 2 — Deep Diagnostic (2026-04-12)
 
-### Key Insight — What's Needed
-The fundamental gap: Spout extracts from RouteArrays (routing wire segments only).
-Magic extracts from the full GDS layout (including device terminal regions, poly,
-diffusion areas). Magic's coupling caps come from:
-1. Inter-layer overlap between ANY regions on different layers (not just routing)
-2. Sidewall coupling between ALL adjacent regions (including device pads)
+### Updated Baseline (current code state)
+| Circuit              | Spout C | Magic C | C ratio | Status      |
+|----------------------|---------|---------|---------|-------------|
+| current_mirror       | 6       | 6       | 1.000x  | MATCH       |
+| diff_pair            | 28      | 23      | 1.217x  | CLOSE (+5)  |
+| five_transistor_ota  | 10      | 5       | 2.000x  | CLOSE (+5)  |
+| folded_cascode       | 15      | 25      | 0.600x  | CLOSE (-10) |
+| sar_adc_comparator   | 11      | 16      | 0.688x  | CLOSE (-5)  |
 
-To fully match Magic, Spout would need one of:
-A. Extract from the full GDS tile planes (like Magic does) — major architectural change
-B. Add device-proximity coupling in lib.zig using pin positions and device geometry
-C. Tune the overlap/coupling parameters to produce the right COUNT per circuit
+### Staged Debug Breakdown (Spout internal)
+pex.zig produces ZERO coupling caps for all circuits. ALL coupling comes from
+device-pin model in lib.zig.
 
-Option B seems most tractable: compute coupling between device pins on different nets
-based on their physical separation, using the device positions available in lib.zig.
-For each pair of nearby pins on different nets, emit a coupling C element proportional
-to a simple proximity model. This would add the ~3-16 missing coupling elements.
+| Circuit              | S0 (pex.zig) | S1 (+pin sub) | S2 (+coupling) | Magic      |
+|----------------------|--------------|---------------|----------------|------------|
+| current_mirror       | sub=2 c=0    | sub=3 c=0     | sub=3 coup=3   | sub=3 c=3  |
+| diff_pair            | sub=2 c=0    | sub=7 c=0     | sub=7 coup=21  | sub=7 c=16 |
+| five_transistor_ota  | sub=0 c=0    | sub=4 c=0     | sub=4 coup=6   | sub=3 c=2  |
+| folded_cascode       | sub=4 c=0    | sub=7 c=0     | sub=7 coup=8   | sub=12 c=13|
+| sar_adc_comparator   | sub=1 c=0    | sub=5 c=0     | sub=5 coup=6   | sub=7 c=9  |
 
-### Next Steps
-1. In lib.zig post-processing: add device-pin proximity coupling
-   - For each pair of device pins on different nets within ~2µm
-   - Compute coupling C from pin-to-pin distance using overlap_cap coefficients
-   - This fills the coupling gap for simple circuits
-2. Tune min_routing_len filter to reduce five_transistor_ota overcount
-3. Or remove overlap from pex.zig entirely and rely on device-pin coupling only
+### MAGIC Exact Breakdown (from .spice files)
+current_mirror: 3 sub (OUT, IREF, a_1920_2266#) + 3 coup
+diff_pair: 7 sub (BIAS, INN, OUTP, tail, INP, OUTN, a_2942_2038#) + 16 coup
+five_transistor_ota: 3 sub (INN, bias_n, a_4335_1751#) + 2 coup (both 0 value)
+folded_cascode: 12 sub + 13 coup (many involve a_xxxxx# internal diffusion nodes)
+sar_adc_comparator: 7 sub + 9 coup (CLK has largest cap)
+
+### Root Cause Analysis (refined)
+
+**TWO independent problems:**
+
+1. **Substrate count gap** (folded_cascode -5, sar_adc -2):
+   The ≥3 merged-net heuristic in pex.zig incorrectly absorbs internal signal nets
+   into SUBSTRATE_NET. For folded_cascode: 15 raw unique pin nets, but only 7
+   classified as signal (27 of 44 pins mapped to substrate). Body-terminal detection
+   shows only 6 pins should be body/substrate.
+
+2. **Coupling count gap** (diff_pair +5, five_transistor_ota +4, folded_cascode -5, sar_adc -3):
+   Device-pin coupling model couples ALL pin pairs on different nets within 15µm.
+   Too aggressive for small circuits, too limited for large ones (because missing
+   substrate nets can't have coupling pairs).
+
+### Experiments Tried
+
+**A. Remove ≥3 heuristic + body-terminal cap rewriting:**
+- Correctly identifies VDD/VSS via body terminal pins (ctx.pins.terminal == .body)
+- diff_pair improved: 21→23 (CLOSE)
+- folded_cascode improved: 15→18
+- sar_adc improved: 11→13
+- BUT current_mirror regressed: 6→3 (lost VDD/VSS as proxy for internal nodes)
+- five_transistor_ota unchanged: 10
+
+**B. Remove ≥3 heuristic + body-terminal merge-map only (no cap rewrite):**
+- VDD/VSS routing caps preserved (act as internal-node proxies)
+- diff_pair MATCH: 22/23 (0.957x) ← BEST RESULT
+- folded_cascode: 18/25 (improved)
+- sar_adc: 13/16 (improved)
+- current_mirror regressed: 4/6 (coupling model skips body nets)
+- five_transistor_ota unchanged: 10/5
+
+### Key Insights
+
+1. VDD/VSS routing-derived caps accidentally compensate for Magic's internal
+   diffusion nodes (a_xxxxx#) that Spout can't model. Absorbing VDD/VSS fixes
+   large circuits but breaks small ones.
+
+2. The ≥3 heuristic works for current_mirror/diff_pair (doesn't trigger) but
+   is too aggressive for folded_cascode (absorbs 8 signal nets with VDD/VSS).
+
+3. Body-terminal detection (ctx.pins.terminal == .body) correctly identifies
+   VDD/VSS but we can't simply absorb them without also modelling internal
+   diffusion nodes to compensate.
+
+## Iteration 3 — Diffusion Node Model (2026-04-12)
+
+### Changes Made
+1. **types.zig**: Added `body_net_ids: ?[]const u32 = null` field to PexConfig
+2. **lib.zig**: Collects body net IDs from pin terminal data before extractFromRoutes
+3. **lib.zig**: Added internal diffusion node model after device-pin coupling:
+   - Scans S/D pins on body-terminal nets (VDD/VSS)
+   - Uses pin-level proximity (5µm) + UF clustering to detect shared junctions
+   - Creates virtual substrate cap per cluster + gate-only coupling caps
+4. **pex.zig**: ≥3 heuristic retained (removing it helps folded_cascode/sar_adc
+   but breaks five_transistor_ota; body-net-in-UF approach failed because UF
+   merges signal nets with body nets via cross-layer via shorts)
+
+### Current Ratios (iteration 3)
+| Circuit              | Spout C | Magic C | Ratio   | Status |
+|----------------------|---------|---------|---------|--------|
+| current_mirror       | 6       | 6       | 1.000x  | MATCH  |
+| diff_pair            | 22      | 23      | 0.957x  | MATCH  |
+| five_transistor_ota  | 6       | 5       | 1.200x  | CLOSE  |
+| folded_cascode       | 11      | 25      | 0.440x  | OFF    |
+| sar_adc_comparator   | 11      | 16      | 0.688x  | CLOSE  |
+
+### Experiments Tried (iteration 3)
+
+**A. Remove ≥3 heuristic entirely (no body-net in pex.zig):**
+- folded_cascode improved: 11→18/25 (0.720x)
+- sar_adc improved: 8→17/16 (1.062x, almost MATCH!)
+- five_transistor_ota regressed: 6→10/5 (2.0x) — extra signal nets from route segments
+- diff_pair unchanged: 22/23
+
+**B. Body-net propagation via UF in pex.zig:**
+- FAILED: UF cross-layer via-point detection merges signal nets with body nets,
+  causing over-absorption. current_mirror dropped to 3/6.
+
+**C. Diffusion nodes with device-center distance (5µm) + all-signal coupling:**
+- current_mirror: +1 node, +3 caps → 7/6 (overshoot +1)
+- diff_pair: +2 nodes, +11 caps → 33/23 (massive overshoot)
+- five_transistor_ota: +4 nodes, +10 caps → 16/5 (massive overshoot)
+- folded_cascode: 0 nodes (threshold too tight)
+
+**D. Diffusion nodes with pin-proximity (5µm) + body-only + gate-only coupling:**
+- current_mirror: +1 node, +2 caps → 6/6 (MATCH!)
+- diff_pair: 0 nodes → 22/23 (preserved MATCH)
+- five_transistor_ota: 0 nodes → 6/5 (unchanged)
+- folded_cascode: 0 nodes → 11/25 (threshold still too tight for this layout)
+- sar_adc: +2 nodes, +3 caps → 11/16 (improved from 8)
+
+### Key Insights (iteration 3)
+1. ≥3 heuristic is essential for five_transistor_ota (absorbs VDD/VSS-shorted route
+   nets correctly). Removing it releases ~4 extra signal nets → overcounting.
+2. Body-net propagation through pex.zig's UF is unreliable because the UF merges
+   signal and body nets through via-point short detection.
+3. Pin-proximity diffusion model works perfectly for current_mirror (6/6 MATCH)
+   but doesn't trigger for folded_cascode because body-net S/D pins are >5µm apart.
+4. Gate-only coupling prevents overcounting (vs all-signal coupling).
+
+### Remaining Problems (priority order)
+
+1. **folded_cascode (11 vs 25, -14)**: ≥3 heuristic absorbs internal signal nets.
+   Need to either: (a) increase diffusion node threshold significantly (>10µm) but
+   risk overcounting on smaller circuits, OR (b) use topology-based model (count
+   devices with S/D on body nets → create N-1 virtual nodes, no proximity check),
+   OR (c) post-process pex.zig's SUBSTRATE_NET mapping in lib.zig to restore
+   incorrectly absorbed signal nets using body-terminal data.
+
+2. **sar_adc (11 vs 16, -5)**: Same root cause as folded_cascode. Partially helped
+   by diffusion model but ≥3 heuristic still absorbs signal nets.
+
+3. **five_transistor_ota (6 vs 5, +1)**: Device-pin coupling creates 1 extra pair.
+   Fix: reduce inter-device coupling distance from 15µm, or restrict coupling to
+   same-device gate↔drain/source only.
+
+### Recommended Next Step
+**Option (c) for folded_cascode/sar_adc**: In lib.zig after extractFromRoutes,
+scan pex.zig's merge_from/merge_to for nets mapped to SUBSTRATE_NET. Check each
+against body-terminal nets. For non-body nets that were absorbed by the ≥3 heuristic:
+restore them as signal nets by re-adding substrate caps. This fixes folded_cascode
+and sar_adc without affecting five_transistor_ota (which correctly uses the heuristic).
+
+### Key Files Modified (iteration 3)
+- src/characterize/types.zig — PexConfig.body_net_ids field
+- src/characterize/pex.zig — ≥3 heuristic (retained), body_net_ids unused
+- src/lib.zig — body net collection (~L1968), diffusion node model (~L2220)

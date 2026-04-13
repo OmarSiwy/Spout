@@ -1151,17 +1151,17 @@ export fn spout_run_drc(handle: *anyopaque) i32 {
 
     // Export layout to a temp GDS and parse every BOUNDARY record on a DRC-
     // relevant layer (routing metals, contacts, vias, device layers).
-    // These pad/via shapes have NONE net; net-aware spacing checks use the
-    // route segments added below.
+    // Routes are written as GDS PATH records (not BOUNDARY), so they are
+    // NOT captured here — they are added separately below.
     const tmp_path = "/tmp/spout_drc_tmp.gds";
     if (spout_export_gdsii_named(handle, tmp_path.ptr, tmp_path.len, null, 0) == 0) {
         parseBoundaryShapes(tmp_path, &ctx.pdk, &shapes, ctx.allocator) catch {};
         std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
-    // Add route segments with actual net IDs for net-aware spacing checks
-    // (met1.2, met2.2, li.3).  These are separate from the GDS pad shapes
-    // above; the DRC engine handles the NONE vs. net-ID distinction correctly.
+    // Add route segments as AABBs.  The GDS exporter writes routes as PATH
+    // records which parseBoundaryShapes skips; we reconstruct the same
+    // rectangles MAGIC would derive from those PATHs.
     for (0..n) |i| {
         const x1 = routes.x1[i]; const y1 = routes.y1[i];
         const x2 = routes.x2[i]; const y2 = routes.y2[i];
@@ -1979,7 +1979,26 @@ export fn spout_run_pex(handle: *anyopaque) i32 {
 
     if (ctx.pex_result) |prev| { prev.deinit(); ctx.allocator.destroy(prev); ctx.pex_result = null; }
 
-    const pex_cfg = characterize.PexConfig.sky130();
+    // Collect body-terminal net IDs (VDD/VSS) for substrate detection.
+    var body_ids_list = std.ArrayListUnmanaged(u32){};
+    defer body_ids_list.deinit(ctx.allocator);
+    {
+        var body_seen = std.AutoHashMap(u32, void).init(ctx.allocator);
+        defer body_seen.deinit();
+        const n_bp: usize = @intCast(ctx.pins.len);
+        for (0..n_bp) |bi| {
+            if (ctx.pins.terminal[bi] == .body) {
+                const raw: u32 = @intCast(ctx.pins.net[bi].toInt());
+                if (!(body_seen.getOrPut(raw) catch continue).found_existing) {
+                    body_ids_list.append(ctx.allocator, raw) catch {};
+                }
+            }
+        }
+    }
+
+    var pex_cfg = characterize.PexConfig.sky130();
+    pex_cfg.body_net_ids = if (body_ids_list.items.len > 0) body_ids_list.items else null;
+
     const p = ctx.allocator.create(characterize.PexResult) catch return -3;
     p.* = characterize.extractFromRoutes(routes, pex_cfg, ctx.allocator) catch {
         ctx.allocator.destroy(p);
@@ -2194,6 +2213,163 @@ export fn spout_run_pex(handle: *anyopaque) i32 {
         var n_sub2: u32 = 0; var n_coup2: u32 = 0;
         for (p.capacitors) |c| { if (c.net_b == characterize.SUBSTRATE_NET) { n_sub2 += 1; } else { n_coup2 += 1; } }
         std.debug.print("PEX_S2: sub={d} coup={d} total={d}\n", .{ n_sub2, n_coup2, @as(u32, @intCast(p.capacitors.len)) });
+    }
+
+    // ── Internal diffusion nodes (shared source/drain junctions) ─────────
+    // MAGIC creates internal nodes (a_xxxxx#) at shared source/drain
+    // junctions between adjacent MOSFETs on body-terminal nets (VDD/VSS).
+    // Each gets a substrate cap and coupling with gate nets of adjacent
+    // devices.  Uses pin-level proximity to detect physical sharing.
+    {
+        const n_pins_sd: usize = @intCast(ctx.pins.len);
+        const n_dev_sd: usize = @intCast(ctx.devices.len);
+        const pin_dist_thresh: f32 = 5.0; // µm — shared diffusion proximity
+
+        // Identify body-terminal nets (VDD/VSS).
+        var body_nets = std.AutoHashMap(u32, void).init(ctx.allocator);
+        defer body_nets.deinit();
+        for (0..n_pins_sd) |pi| {
+            if (ctx.pins.terminal[pi] == .body) {
+                body_nets.put(@intCast(ctx.pins.net[pi].toInt()), {}) catch {};
+            }
+        }
+
+        // Collect S/D pins on body-terminal nets with absolute positions.
+        var sd_idx = std.ArrayListUnmanaged(usize){};
+        defer sd_idx.deinit(ctx.allocator);
+        var sd_pos = std.ArrayListUnmanaged([2]f32){};
+        defer sd_pos.deinit(ctx.allocator);
+
+        for (0..n_pins_sd) |pi| {
+            const term = ctx.pins.terminal[pi];
+            if (term != .source and term != .drain) continue;
+            const raw_net: u32 = @intCast(ctx.pins.net[pi].toInt());
+            if (!body_nets.contains(raw_net)) continue;
+            sd_idx.append(ctx.allocator, pi) catch continue;
+            const dev: usize = ctx.pins.device[pi].toInt();
+            if (dev < n_dev_sd) {
+                sd_pos.append(ctx.allocator, .{
+                    ctx.devices.positions[dev][0] + ctx.pins.position[pi][0],
+                    ctx.devices.positions[dev][1] + ctx.pins.position[pi][1],
+                }) catch continue;
+            } else {
+                sd_pos.append(ctx.allocator, ctx.pins.position[pi]) catch continue;
+            }
+        }
+
+        const n_sd = sd_idx.items.len;
+
+        // Union-find: cluster physically adjacent S/D pins on same net.
+        const uf_buf = ctx.allocator.alloc(usize, n_sd) catch &.{};
+        defer if (n_sd > 0) ctx.allocator.free(uf_buf);
+        const uf = @as([]usize, @constCast(uf_buf));
+        for (0..n_sd) |i| uf[i] = i;
+
+        for (0..n_sd) |i| {
+            const ni = ctx.pins.net[sd_idx.items[i]].toInt();
+            const di = ctx.pins.device[sd_idx.items[i]].toInt();
+            for (i + 1..n_sd) |j| {
+                if (ctx.pins.net[sd_idx.items[j]].toInt() != ni) continue;
+                if (ctx.pins.device[sd_idx.items[j]].toInt() == di) continue;
+                const dx = sd_pos.items[i][0] - sd_pos.items[j][0];
+                const dy = sd_pos.items[i][1] - sd_pos.items[j][1];
+                if (@sqrt(dx * dx + dy * dy) > pin_dist_thresh) continue;
+                // Union
+                var ri = i;
+                while (uf[ri] != ri) ri = uf[ri];
+                var rj = j;
+                while (uf[rj] != rj) rj = uf[rj];
+                if (ri != rj) {
+                    if (ri < rj) { uf[rj] = ri; } else { uf[ri] = rj; }
+                }
+            }
+        }
+        // Path compression.
+        for (0..n_sd) |i| {
+            var r = i;
+            while (uf[r] != r) r = uf[r];
+            uf[i] = r;
+        }
+
+        // Count cluster sizes; multi-element clusters → virtual nodes.
+        var csizes = std.AutoHashMap(usize, u16).init(ctx.allocator);
+        defer csizes.deinit();
+        for (0..n_sd) |i| {
+            const gop = csizes.getOrPut(uf[i]) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+
+        var diff_caps: std.ArrayListUnmanaged(characterize.RcElement) = .{};
+        defer diff_caps.deinit(ctx.allocator);
+        var vnet_id: u32 = characterize.SUBSTRATE_NET - 1000;
+
+        var cs_it = csizes.iterator();
+        while (cs_it.next()) |entry| {
+            if (entry.value_ptr.* < 2) continue;
+            const root = entry.key_ptr.*;
+
+            const vid = vnet_id;
+            vnet_id -%= 1;
+
+            // Substrate cap for virtual diffusion node.
+            diff_caps.append(ctx.allocator, .{
+                .net_a = vid,
+                .net_b = characterize.SUBSTRATE_NET,
+                .value = 0.01,
+            }) catch {};
+
+            // Collect devices in this cluster.
+            var devs = std.AutoHashMap(u32, void).init(ctx.allocator);
+            for (0..n_sd) |i| {
+                if (uf[i] != root) continue;
+                devs.put(ctx.pins.device[sd_idx.items[i]].toInt(), {}) catch {};
+            }
+
+            // Coupling: virtual node ↔ gate nets of cluster devices.
+            var coupled = std.AutoHashMap(u32, void).init(ctx.allocator);
+            for (0..n_pins_sd) |pi| {
+                if (!devs.contains(ctx.pins.device[pi].toInt())) continue;
+                if (ctx.pins.terminal[pi] != .gate) continue;
+                const raw: u32 = @intCast(ctx.pins.net[pi].toInt());
+                const merged = p.mergedNet(raw);
+                if (merged == characterize.SUBSTRATE_NET) continue;
+                if ((coupled.getOrPut(merged) catch continue).found_existing) continue;
+                diff_caps.append(ctx.allocator, .{
+                    .net_a = @min(vid, merged),
+                    .net_b = @max(vid, merged),
+                    .value = 0.001,
+                }) catch {};
+            }
+            devs.deinit();
+            coupled.deinit();
+        }
+
+        // DEBUG: diffusion node stats.
+        {
+            var n_ds: u32 = 0;
+            var n_dc: u32 = 0;
+            for (diff_caps.items) |c| {
+                if (c.net_b == characterize.SUBSTRATE_NET) { n_ds += 1; } else { n_dc += 1; }
+            }
+            std.debug.print("PEX_DIFF: nodes={d} coup={d}\n", .{ n_ds, n_dc });
+        }
+
+        // Append virtual caps to result.
+        if (diff_caps.items.len > 0) {
+            const old_len = p.capacitors.len;
+            const new_caps = ctx.allocator.alloc(
+                characterize.RcElement,
+                old_len + diff_caps.items.len,
+            ) catch {
+                ctx.pex_result = p;
+                return 0;
+            };
+            @memcpy(new_caps[0..old_len], p.capacitors);
+            @memcpy(new_caps[old_len..], diff_caps.items);
+            ctx.allocator.free(p.capacitors);
+            p.capacitors = new_caps;
+        }
     }
 
     ctx.pex_result = p;

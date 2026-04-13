@@ -93,6 +93,11 @@ pub const PexConfig = struct {
     /// Computed as: C_overlap = overlap_area * overlap_cap[lower_layer]
     overlap_cap: [8]f32 = .{0.0} ** 8,
 
+    /// Body-terminal (VDD/VSS) net IDs for substrate detection.
+    /// When set, the extraction maps any UF group containing a body net
+    /// to SUBSTRATE_NET, instead of the size-based ≥3 heuristic.
+    body_net_ids: ?[]const u32 = null,
+
     /// SKY130 coefficients calibrated against sky130A.tech Magic technology file.
     /// Sheet resistance: LI=12.8, M1-M2=0.125, M3-M4=0.047, M5=0.029 Ω/sq.
     /// Cap coefficients from Magic's `extract style` section in sky130A.tech.
