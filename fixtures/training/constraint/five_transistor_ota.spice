@@ -1,0 +1,8 @@
+* Five Transistor OTA - SKY130
+.subckt five_transistor_ota VDD VSS INP INN OUT
+M1 tail INP diff_a VSS nmos w=2u l=0.15u m=1
+M2 tail INN diff_b VSS nmos w=2u l=0.15u m=1
+M3 VDD VDD diff_a VDD pmos w=4u l=0.15u m=1
+M4 VDD VDD diff_b VDD pmos w=4u l=0.15u m=1
+M5 tail bias_n VSS VSS nmos w=4u l=0.15u m=2
+.ends five_transistor_ota

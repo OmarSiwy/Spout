@@ -1,0 +1,22 @@
+## DRC Ralph Loop Progress
+
+### Baseline (2026-04-12)
+| Circuit | Spout | MAGIC | Delta |
+|---------|-------|-------|-------|
+| current_mirror | 174 | 218 | -44 |
+| diff_pair | 286 | 335 | -49 |
+| five_transistor_ota | 460 | 586 | -126 |
+| **Total delta** | | | **219** |
+
+### Spout Category Breakdown
+current_mirror: min_area=18, min_enclosure=92, min_spacing=64
+diff_pair: min_area=34, min_enclosure=152, min_spacing=100
+five_transistor_ota: min_area=30, min_enclosure=186, min_spacing=218, short=26
+
+### Missing MAGIC Rules (highest impact)
+1. diff/tap.11: tap(65,44) to nwell(64,20) spacing 0.13um — 201 rects in five_transistor_ota
+2. diff/tap.10: nwell(64,20) over tap(65,44) enclosure 0.18um — 71 rects
+3. diff/tap.9: diff(65,20) to nwell(64,20) spacing 0.34um — 15 rects
+4. licon.5a: diff(65,20) over licon(66,44) enclosure 0.04um — 53 rects
+5. licon.8: poly(66,20) over licon(66,44) enclosure 0.05um — 8 rects
+6. False shorts: 26 Spout violations vs 0 MAGIC in five_transistor_ota

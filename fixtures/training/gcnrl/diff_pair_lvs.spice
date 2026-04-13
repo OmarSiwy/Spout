@@ -1,0 +1,20 @@
+* Differential Pair with Tail Current Source - SKY130
+* Simple NMOS differential pair (M1, M2) biased by a tail
+* current source (M3). Outputs are taken at the drains.
+
+.global VSS
+.subckt diff_pair VSS INP INN OUTP OUTN BIAS
+
+* M1 — input NMOS (positive input)
+* Drain=OUTN, Gate=INP, Source=tail, Bulk=VSS
+M1 OUTN INP tail VSS sky130_fd_pr__nfet_01v8 W=2.0000e-06 L=1.5000e-07 m=1
+
+* M2 — input NMOS (negative input)
+* Drain=OUTP, Gate=INN, Source=tail, Bulk=VSS
+M2 OUTP INN tail VSS sky130_fd_pr__nfet_01v8 W=2.0000e-06 L=1.5000e-07 m=1
+
+* M3 — tail current source
+* Drain=tail, Gate=BIAS, Source=VSS, Bulk=VSS
+M3 tail BIAS VSS VSS sky130_fd_pr__nfet_01v8 W=4.0000e-06 L=1.5000e-07 m=2
+
+.ends diff_pair

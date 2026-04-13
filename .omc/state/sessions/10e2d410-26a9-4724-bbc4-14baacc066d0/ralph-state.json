@@ -1,0 +1,12 @@
+{
+  "active": true,
+  "iteration": 1,
+  "max_iterations": 100,
+  "started_at": "2026-04-13T02:07:55.311Z",
+  "prompt": "/ralph @prompts/PROMPT_LVS.md",
+  "session_id": "10e2d410-26a9-4724-bbc4-14baacc066d0",
+  "project_path": "/home/omare/Documents/Projects/Active/Spout",
+  "linked_ultrawork": true,
+  "awaiting_confirmation": true,
+  "last_checked_at": "2026-04-13T02:07:55.312Z"
+}

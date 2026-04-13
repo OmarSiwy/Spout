@@ -1,0 +1,10 @@
+* Five Transistor OTA - SKY130
+.global VSS
+.global VSS
+.subckt five_transistor_ota VDD VSS INP INN
+M1 tail INP diff_a VSS sky130_fd_pr__nfet_01v8 W=2.0000e-06 L=1.5000e-07 m=1
+M2 tail INN diff_b VSS sky130_fd_pr__nfet_01v8 W=2.0000e-06 L=1.5000e-07 m=1
+M3 VDD VDD diff_a VDD sky130_fd_pr__pfet_01v8 W=4.0000e-06 L=1.5000e-07 m=1
+M4 VDD VDD diff_b VDD sky130_fd_pr__pfet_01v8 W=4.0000e-06 L=1.5000e-07 m=1
+M5 tail bias_n VSS VSS sky130_fd_pr__nfet_01v8 W=4.0000e-06 L=1.5000e-07 m=2
+.ends five_transistor_ota

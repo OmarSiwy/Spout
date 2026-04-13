@@ -1,0 +1,33 @@
+name: Docs Check
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'python/**'
+      - 'build.zig'
+      - 'flake.nix'
+      - 'docs/**'
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if docs were updated alongside source changes
+        run: |
+          # Get changed files in this PR
+          SOURCE_CHANGED=$(git diff --name-only origin/main...HEAD -- src/ python/ build.zig flake.nix | wc -l)
+          DOCS_CHANGED=$(git diff --name-only origin/main...HEAD -- docs/ | wc -l)
+
+          if [ "$SOURCE_CHANGED" -gt 0 ] && [ "$DOCS_CHANGED" -eq 0 ]; then
+            echo "::warning::Source files changed but docs/ was not updated. Please review if documentation needs updating."
+          fi
+
+      - name: Install mdbook
+        run: cargo install mdbook
+
+      - name: Build docs
+        run: mdbook build docs/

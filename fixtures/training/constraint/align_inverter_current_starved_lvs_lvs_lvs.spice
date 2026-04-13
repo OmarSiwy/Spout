@@ -1,0 +1,12 @@
+.global vss
+.global vss
+.global vss
+.subckt inverter_current_starved vcc vin vip von vop vss
+mmp0 vop vin vcc vcc sky130_fd_pr__pfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=4
+mmn0 vop vin vss vss sky130_fd_pr__nfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=4
+mmp1 von vip vxx vcc sky130_fd_pr__pfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=4
+mmn1 von vip vss vss sky130_fd_pr__nfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=4
+mmp2 von vip vxx vcc sky130_fd_pr__pfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=8
+mmn2 von vip vss vss sky130_fd_pr__nfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=8
+mmp3 vxx clk vcc vcc sky130_fd_pr__pfet_01v8 W=1.8000e-07 L=4.0000e-08 nfin=4 nf=2 m=8
+.ends inverter_current_starved

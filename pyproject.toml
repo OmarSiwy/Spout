@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spout"
+version = "0.1.0"
+description = "Spout2 — ML-enhanced analog IC layout automation"
+readme = "docs/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "numpy>=1.24",
+    "volare>=0.18",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0",
+    "torch-geometric>=2.3",
+    "onnx>=1.14",
+    "onnxruntime>=1.15",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+spout = "spout.main:main"
+
+[tool.setuptools]
+packages = [
+    "spout",
+    "spout.constraint",
+    "spout.gcnrl",
+    "spout.surrogate",
+    "spout.unet",
+    "spout.utility",
+]
+
+[tool.setuptools.package-dir]
+spout = "python"
+
+[tool.setuptools.package-data]
+spout = ["*.so", "*.dylib", "*.dll"]

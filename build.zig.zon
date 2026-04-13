@@ -1,0 +1,7 @@
+.{
+    .fingerprint = 0x775d9e9f81d408e6,
+    .name = .spout2,
+    .version = "0.1.0",
+    .dependencies = .{},
+    .paths = .{ "src", "build.zig", "build.zig.zon" },
+}

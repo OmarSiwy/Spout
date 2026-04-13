@@ -1,0 +1,15 @@
+* NMOS Current Mirror - SKY130
+* Simple 2-transistor current mirror: diode-connected reference + mirror output.
+* Iref flows into IREF pin; mirrored current sourced from OUT.
+
+.subckt current_mirror VDD VSS IREF OUT
+
+* M1 — diode-connected reference (gate tied to drain)
+* Drain=IREF, Gate=IREF, Source=VSS, Bulk=VSS
+M1 IREF IREF VSS VSS nmos w=1u l=0.15u m=1
+
+* M2 — mirror transistor (gate shares bias with M1)
+* Drain=OUT, Gate=IREF, Source=VSS, Bulk=VSS
+M2 OUT IREF VSS VSS nmos w=1u l=0.15u m=1
+
+.ends current_mirror

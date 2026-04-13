@@ -1,0 +1,12 @@
+{
+  "active": true,
+  "iteration": 1,
+  "max_iterations": 100,
+  "started_at": "2026-04-13T02:35:23.489Z",
+  "prompt": "/ralph @prompts/PROMPT_DRC.md",
+  "session_id": "e2db21cb-ac1e-4f67-a531-22e99d1dca03",
+  "project_path": "/home/omare/Documents/Projects/Active/Spout",
+  "linked_ultrawork": true,
+  "awaiting_confirmation": true,
+  "last_checked_at": "2026-04-13T02:35:23.489Z"
+}

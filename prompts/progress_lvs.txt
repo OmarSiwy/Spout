@@ -1,0 +1,26 @@
+## LVS ext2spice Progress
+
+### Iteration 1 (2026-04-12)
+
+**Starting state**: 22/39 Spout=MATCH, 17 MISMATCH
+
+**Root causes identified**:
+1. Wrong subcircuit selection: `pr.subcircuits[0]` (first/leaf) instead of last (top-level)
+2. Devices from ALL subcircuit scopes mixed into flat output — no scope tracking
+3. X device terminals all `.anode` → sorted order scrambled → `?` in output
+4. compare_lvs.py exit condition checked agreement (impossible since MAGIC=0/39 MATCH)
+
+**Changes made**:
+- `src/netlist/types.zig`: Added `port_order: u16` to PinEdge, `device_start/device_end: u32` to Subcircuit
+- `src/netlist/tokenizer.zig`: Track device ranges per subcircuit (parseSubcktBegin/End), port_order for X instance pins, sort tiebreaker on port_order
+- `src/characterize/ext2spice.zig`: Made terminalOrder, writeDefaultModel, writeParams public
+- `src/lib.zig`: Rewrote spout_ext2spice — single subcircuit uses SpiceWriter (backward compat), multi-subcircuit emits hierarchical SPICE via writeSubcircuitFromPR
+- `scripts/compare_lvs.py`: Exit condition changed from `agreed == total_valid` to `spout_match_count == total_valid`
+
+**Verified**: align_adder flipped from MISMATCH to MATCH with verbose test.
+**Pending**: Full --all run in progress.
+
+### Known issue for next iteration
+- If any circuits still MISMATCH, run with `--verbose` on first failing circuit
+- Check if R/C model names or parameter values cause NETGEN property mismatches
+- Check deeply nested hierarchies (align_comparator_hierarchical has 4+ levels)

@@ -1,0 +1,45 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Nix
+result
+
+# Project-specific
+output/
+.volare/
+docs/book/
+
+# ML training artifacts
+checkpoints/
+**/checkpoints/
+.ipynb_checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Shared libraries (build artifacts)
+*.so
+*.dylib
+*.dll
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

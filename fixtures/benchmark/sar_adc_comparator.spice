@@ -1,0 +1,62 @@
+* SAR ADC Comparator — Strong-Arm Latch - SKY130
+* 12-transistor strong-arm latch comparator.
+*
+* Operation:
+*   CLK low  -> reset phase (outputs pre-charged to VDD)
+*   CLK high -> evaluation phase (regenerative latch resolves)
+*
+* Topology:
+*   - M1, M2  : NMOS input pair
+*   - M3      : NMOS tail switch (clocked)
+*   - M4, M5  : PMOS reset switches (clocked)
+*   - M6, M7  : PMOS cross-coupled latch pair
+*   - M8, M9  : NMOS cross-coupled latch pair
+*   - M10, M11: NMOS output isolation switches (clocked)
+*   - M12     : PMOS pre-charge (clocked)
+
+.subckt sar_adc_comparator VDD VSS INP INN OUTP OUTN CLK
+
+* --- NMOS input differential pair ---
+* M1 — positive input
+M1 int_p INP tail VSS nmos w=2u l=0.15u m=2
+
+* M2 — negative input
+M2 int_n INN tail VSS nmos w=2u l=0.15u m=2
+
+* --- Tail switch (clocked) ---
+* M3 — enables evaluation when CLK is high
+M3 tail CLK VSS VSS nmos w=4u l=0.15u m=2
+
+* --- PMOS reset switches ---
+* M4 — resets int_p to VDD when CLK is low
+M4 int_p CLK VDD VDD pmos w=1u l=0.15u m=1
+
+* M5 — resets int_n to VDD when CLK is low
+M5 int_n CLK VDD VDD pmos w=1u l=0.15u m=1
+
+* --- Cross-coupled PMOS latch ---
+* M6 — gate driven by int_n, pulls int_p toward VDD
+M6 int_p int_n VDD VDD pmos w=2u l=0.15u m=1
+
+* M7 — gate driven by int_p, pulls int_n toward VDD
+M7 int_n int_p VDD VDD pmos w=2u l=0.15u m=1
+
+* --- Cross-coupled NMOS latch ---
+* M8 — gate driven by int_n, pulls int_p toward VSS
+M8 int_p int_n VSS VSS nmos w=1u l=0.15u m=1
+
+* M9 — gate driven by int_p, pulls int_n toward VSS
+M9 int_n int_p VSS VSS nmos w=1u l=0.15u m=1
+
+* --- Output isolation switches ---
+* M10 — passes resolved int_p to OUTP during evaluation
+M10 OUTP CLK int_p VSS nmos w=0.84u l=0.15u m=1
+
+* M11 — passes resolved int_n to OUTN during evaluation
+M11 OUTN CLK int_n VSS nmos w=0.84u l=0.15u m=1
+
+* --- Output pre-charge ---
+* M12 — weakly pulls OUTP high during reset (optional)
+M12 OUTP CLK VDD VDD pmos w=0.42u l=0.15u m=1
+
+.ends sar_adc_comparator

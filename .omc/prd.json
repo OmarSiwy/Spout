@@ -1,0 +1,60 @@
+{
+  "title": "DRC Equivalence: Spout In-Engine DRC == MAGIC DRC (delta=0 for all circuits)",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Fix false SHORT violations (Spout reports shorts MAGIC doesn't)",
+      "priority": 1,
+      "passes": false,
+      "acceptanceCriteria": [
+        "five_transistor_ota SHORT count matches MAGIC (currently 26 vs 0)",
+        "No regression in other rule categories",
+        "Build succeeds with zig build -Doptimize=ReleaseFast"
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Close remaining min_enclosure gap",
+      "priority": 2,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Spout min_enclosure count matches MAGIC overlap category for all 3 circuits",
+        "enc_rules for nwell/tap/diff/licon produce correct violation counts",
+        "No regression in other rule categories"
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Close remaining min_spacing gap (cross-layer + same-layer)",
+      "priority": 3,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Spout min_spacing count matches MAGIC spacing category for all 3 circuits",
+        "cross_rules for tap-nwell, diff-nwell, poly-diff produce correct counts",
+        "No regression in other rule categories"
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Close min_area and min_width gaps",
+      "priority": 4,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Spout min_area count matches MAGIC for all 3 circuits",
+        "Spout min_width count matches MAGIC for all 3 circuits",
+        "No regression in other rule categories"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Full suite: delta=0 for all benchmark circuits",
+      "priority": 5,
+      "passes": false,
+      "acceptanceCriteria": [
+        "python scripts/compare_drc.py --all exits 0 (using nix develop .#test)",
+        "delta=0 for current_mirror, diff_pair, five_transistor_ota",
+        "No ERROR results for any circuit"
+      ]
+    }
+  ]
+}

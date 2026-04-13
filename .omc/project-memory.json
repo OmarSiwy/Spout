@@ -1,0 +1,465 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776030067979,
+  "projectRoot": "/home/omare/Documents/Projects/Active/Spout",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "PROGRESS": {
+      "path": "PROGRESS",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1776030067977,
+      "keyFiles": [
+        "DRC.md",
+        "LVS.md",
+        "PEX.md"
+      ]
+    },
+    "PROMPTS": {
+      "path": "PROMPTS",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1776030067977,
+      "keyFiles": [
+        "DRC.md",
+        "LVS.md",
+        "PEX.md"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 0,
+      "lastAccessed": 1776030067978,
+      "keyFiles": []
+    },
+    "fixtures": {
+      "path": "fixtures",
+      "purpose": "Test fixtures",
+      "fileCount": 0,
+      "lastAccessed": 1776030067978,
+      "keyFiles": []
+    },
+    "pdks": {
+      "path": "pdks",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1776030067978,
+      "keyFiles": [
+        "gf180.json",
+        "ihp130.json",
+        "sky130.json"
+      ]
+    },
+    "python": {
+      "path": "python",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1776030067978,
+      "keyFiles": [
+        "README.md",
+        "__init__.py",
+        "config.py",
+        "ffi.py",
+        "libspout.so"
+      ]
+    },
+    "references": {
+      "path": "references",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776030067978,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 1,
+      "lastAccessed": 1776030067978,
+      "keyFiles": [
+        "benchmark.py"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1776030067978,
+      "keyFiles": [
+        "lib.zig"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 10,
+      "lastAccessed": 1776030067979,
+      "keyFiles": [
+        "conftest.py",
+        "e2e_tests.zig",
+        "size_runner.zig",
+        "test_drc_vs_magic.py",
+        "test_lvs_vs_netgen.py"
+      ]
+    },
+    "fixtures/test": {
+      "path": "fixtures/test",
+      "purpose": "Test files",
+      "fileCount": 18,
+      "lastAccessed": 1776030067979,
+      "keyFiles": [
+        "align_five_transistor_ota.spice",
+        "align_five_transistor_ota_lvs.spice",
+        "align_five_transistor_ota_lvs_lvs.spice"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/lib.zig",
+      "accessCount": 237,
+      "lastAccessed": 1776048207725,
+      "type": "file"
+    },
+    {
+      "path": "src/characterize/drc.zig",
+      "accessCount": 89,
+      "lastAccessed": 1776047739335,
+      "type": "file"
+    },
+    {
+      "path": "src/characterize/pex.zig",
+      "accessCount": 71,
+      "lastAccessed": 1776047964213,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 64,
+      "lastAccessed": 1776046919173,
+      "type": "directory"
+    },
+    {
+      "path": "python/ffi.py",
+      "accessCount": 39,
+      "lastAccessed": 1776048178786,
+      "type": "directory"
+    },
+    {
+      "path": "pdks/sky130.json",
+      "accessCount": 38,
+      "lastAccessed": 1776047748277,
+      "type": "file"
+    },
+    {
+      "path": "src",
+      "accessCount": 37,
+      "lastAccessed": 1776048098365,
+      "type": "directory"
+    },
+    {
+      "path": "src/characterize/types.zig",
+      "accessCount": 30,
+      "lastAccessed": 1776047945567,
+      "type": "file"
+    },
+    {
+      "path": "src/core/layout_if.zig",
+      "accessCount": 24,
+      "lastAccessed": 1776047744325,
+      "type": "file"
+    },
+    {
+      "path": "tests/conftest.py",
+      "accessCount": 17,
+      "lastAccessed": 1776037383175,
+      "type": "file"
+    },
+    {
+      "path": "python",
+      "accessCount": 17,
+      "lastAccessed": 1776047998758,
+      "type": "directory"
+    },
+    {
+      "path": "references/magic/extract/ExtTech.c",
+      "accessCount": 14,
+      "lastAccessed": 1776035030142,
+      "type": "file"
+    },
+    {
+      "path": "python/pipeline.py",
+      "accessCount": 13,
+      "lastAccessed": 1776048005787,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/extract/ExtCouple.c",
+      "accessCount": 12,
+      "lastAccessed": 1776034673103,
+      "type": "file"
+    },
+    {
+      "path": "scripts/compare_pex_values.py",
+      "accessCount": 12,
+      "lastAccessed": 1776038927683,
+      "type": "file"
+    },
+    {
+      "path": "src/router/maze.zig",
+      "accessCount": 11,
+      "lastAccessed": 1776035214177,
+      "type": "file"
+    },
+    {
+      "path": "scripts/benchmark.py",
+      "accessCount": 10,
+      "lastAccessed": 1776037283991,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_lvs_vs_netgen.py",
+      "accessCount": 10,
+      "lastAccessed": 1776040331982,
+      "type": "file"
+    },
+    {
+      "path": "src/characterize/lib.zig",
+      "accessCount": 10,
+      "lastAccessed": 1776044280716,
+      "type": "file"
+    },
+    {
+      "path": "src/export/gdsii.zig",
+      "accessCount": 10,
+      "lastAccessed": 1776048106413,
+      "type": "directory"
+    },
+    {
+      "path": "tests/test_drc_vs_magic.py",
+      "accessCount": 8,
+      "lastAccessed": 1776037330878,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_pex_vs_magic.py",
+      "accessCount": 8,
+      "lastAccessed": 1776038946404,
+      "type": "file"
+    },
+    {
+      "path": "src/characterize/lvs.zig",
+      "accessCount": 8,
+      "lastAccessed": 1776040312786,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/extract/ExtBasic.c",
+      "accessCount": 7,
+      "lastAccessed": 1776034600688,
+      "type": "directory"
+    },
+    {
+      "path": "references/magic/extract",
+      "accessCount": 7,
+      "lastAccessed": 1776034849359,
+      "type": "directory"
+    },
+    {
+      "path": "PROGRESS/DRC.md",
+      "accessCount": 7,
+      "lastAccessed": 1776037209794,
+      "type": "file"
+    },
+    {
+      "path": "PROGRESS/PEX.md",
+      "accessCount": 7,
+      "lastAccessed": 1776037212018,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/drc/DRCmain.c",
+      "accessCount": 6,
+      "lastAccessed": 1776037371422,
+      "type": "file"
+    },
+    {
+      "path": "src/pdk/pdk.zig",
+      "accessCount": 6,
+      "lastAccessed": 1776040583065,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/drc/DRCbasic.c",
+      "accessCount": 5,
+      "lastAccessed": 1776034075291,
+      "type": "file"
+    },
+    {
+      "path": "src/core/route_arrays.zig",
+      "accessCount": 5,
+      "lastAccessed": 1776037400779,
+      "type": "directory"
+    },
+    {
+      "path": "src/core/device_arrays.zig",
+      "accessCount": 5,
+      "lastAccessed": 1776044103673,
+      "type": "directory"
+    },
+    {
+      "path": "src/pdk/json_parser.zig",
+      "accessCount": 4,
+      "lastAccessed": 1776040545190,
+      "type": "file"
+    },
+    {
+      "path": "references/netgen/base/netcmp.c",
+      "accessCount": 3,
+      "lastAccessed": 1776031098022,
+      "type": "directory"
+    },
+    {
+      "path": "src/pdk",
+      "accessCount": 3,
+      "lastAccessed": 1776035244265,
+      "type": "directory"
+    },
+    {
+      "path": "PROMPTS/DRC.md",
+      "accessCount": 3,
+      "lastAccessed": 1776035739186,
+      "type": "file"
+    },
+    {
+      "path": "PROMPTS/PEX.md",
+      "accessCount": 3,
+      "lastAccessed": 1776035819424,
+      "type": "file"
+    },
+    {
+      "path": "PROMPTS/LVS.md",
+      "accessCount": 3,
+      "lastAccessed": 1776035875290,
+      "type": "file"
+    },
+    {
+      "path": "src/router/lib.zig",
+      "accessCount": 2,
+      "lastAccessed": 1776031499708,
+      "type": "file"
+    },
+    {
+      "path": "PROMPTS/PEX_HANDOFF.md",
+      "accessCount": 2,
+      "lastAccessed": 1776033475538,
+      "type": "file"
+    },
+    {
+      "path": "src/core/shape_arrays.zig",
+      "accessCount": 2,
+      "lastAccessed": 1776035337779,
+      "type": "file"
+    },
+    {
+      "path": "references/netgen/base",
+      "accessCount": 2,
+      "lastAccessed": 1776036255160,
+      "type": "directory"
+    },
+    {
+      "path": "PROGRESS/LVS.md",
+      "accessCount": 2,
+      "lastAccessed": 1776037213770,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/drc/drc.h",
+      "accessCount": 2,
+      "lastAccessed": 1776037333667,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/commands/CmdCD.c",
+      "accessCount": 2,
+      "lastAccessed": 1776037354403,
+      "type": "file"
+    },
+    {
+      "path": "python/config.py",
+      "accessCount": 2,
+      "lastAccessed": 1776037360471,
+      "type": "file"
+    },
+    {
+      "path": "scripts",
+      "accessCount": 1,
+      "lastAccessed": 1776031047497,
+      "type": "directory"
+    },
+    {
+      "path": "references/netgen/base/netcmp.h",
+      "accessCount": 1,
+      "lastAccessed": 1776031088563,
+      "type": "file"
+    },
+    {
+      "path": "references/netgen/base/netgen.h",
+      "accessCount": 1,
+      "lastAccessed": 1776031088765,
+      "type": "file"
+    },
+    {
+      "path": "references/magic/extract/extractInt.h",
+      "accessCount": 1,
+      "lastAccessed": 1776031171275,
+      "type": "directory"
+    }
+  ],
+  "userDirectives": []
+}

@@ -1,0 +1,30 @@
+{
+  "name": "ihp130",
+  "num_metal_layers": 5,
+  "db_unit": 0.001,
+  "param_to_um": 1000000.0,
+  "tile_size": 1.0,
+  "min_spacing":   [0.18, 0.18, 0.20, 0.20, 0.40, 0.0, 0.0, 0.0],
+  "min_width":     [0.16, 0.16, 0.20, 0.20, 0.40, 0.0, 0.0, 0.0],
+  "via_width":     [0.19, 0.19, 0.19, 0.19, 0.36, 0.0, 0.0, 0.0],
+  "min_enclosure": [0.05, 0.05, 0.06, 0.06, 0.10, 0.0, 0.0, 0.0],
+  "metal_pitch":   [0.42, 0.42, 0.48, 0.48, 0.96, 0.0, 0.0, 0.0],
+  "layer_map":     [8, 10, 30, 50, 70, 0, 0, 0],
+  "metal_direction": ["horizontal", "vertical", "horizontal", "vertical", "horizontal", "horizontal", "horizontal", "horizontal"],
+  "layers": {
+    "nwell":     [31, 0],
+    "diff":      [3,  0],
+    "tap":       [3,  0],
+    "poly":      [5,  0],
+    "nsdm":      [29, 0],
+    "psdm":      [31, 0],
+    "npc":       [5,  0],
+    "licon":     [6,  0],
+    "li":        [8,  0],
+    "mcon":      [9,  0],
+    "metal":     [[10, 0], [30, 0], [50, 0], [70, 0], [90, 0]],
+    "via":       [[19, 0], [39, 0], [59, 0], [79, 0]],
+    "li_pin":    [8,  16],
+    "metal_pin": [[10, 16], [30, 16], [50, 16], [70, 16], [90, 16]]
+  }
+}

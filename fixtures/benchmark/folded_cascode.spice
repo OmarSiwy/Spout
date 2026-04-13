@@ -1,0 +1,45 @@
+* Folded Cascode OTA - SKY130
+* Fully-differential folded cascode operational transconductance amplifier.
+* 10 transistors: NMOS diff pair (M1-M2), PMOS folding transistors (M3-M4),
+* PMOS cascode loads (M5-M6), NMOS cascode current sources (M7-M8),
+* NMOS tail current source (M9), and PMOS bias current source (M10).
+
+.subckt folded_cascode VDD VSS INP INN OUTP OUTN BIAS_N BIAS_P CASC_N CASC_P
+
+* --- Input differential pair (NMOS) ---
+* M1 — positive input
+M1 fold_a INP tail VSS nmos w=4u l=0.15u m=2
+
+* M2 — negative input
+M2 fold_b INN tail VSS nmos w=4u l=0.15u m=2
+
+* --- PMOS folding transistors ---
+* M3 — folds current from M1 drain into cascode stack
+M3 fold_a BIAS_P VDD VDD pmos w=6u l=0.15u m=2
+
+* M4 — folds current from M2 drain into cascode stack
+M4 fold_b BIAS_P VDD VDD pmos w=6u l=0.15u m=2
+
+* --- PMOS cascode loads ---
+* M5 — cascode device on positive output
+M5 OUTP CASC_P fold_a VDD pmos w=6u l=0.15u m=2
+
+* M6 — cascode device on negative output
+M6 OUTN CASC_P fold_b VDD pmos w=6u l=0.15u m=2
+
+* --- NMOS cascode current sources ---
+* M7 — cascode NMOS on positive output
+M7 OUTP CASC_N cas_a VSS nmos w=4u l=0.15u m=2
+
+* M8 — cascode NMOS on negative output
+M8 OUTN CASC_N cas_b VSS nmos w=4u l=0.15u m=2
+
+* --- Bias current sources ---
+* M9 — tail current source for input pair
+M9 tail BIAS_N VSS VSS nmos w=8u l=0.15u m=2
+
+* M10 — bottom NMOS current sources (shared bias)
+M10a cas_a BIAS_N VSS VSS nmos w=4u l=0.15u m=2
+M10b cas_b BIAS_N VSS VSS nmos w=4u l=0.15u m=2
+
+.ends folded_cascode
