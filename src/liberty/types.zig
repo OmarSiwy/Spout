@@ -93,21 +93,34 @@ pub const PgPin = struct {
 
 // ─── NLDM 2D lookup table ──────────────────────────────────────────────────
 
-pub const NLDM_SIZE: usize = 7;
-
 pub const NldmTable = struct {
-    /// 2D values [slew_idx][load_idx]. Rows = input slew, cols = output load.
-    values: [NLDM_SIZE][NLDM_SIZE]f64,
+    /// Flat 2D values in row-major order. Rows = input slew, cols = output load.
+    values: []f64,
+    rows: usize,
+    cols: usize,
 
-    /// Create a table filled with a single scalar value.
-    pub fn scalar(val: f64) NldmTable {
-        var t: NldmTable = undefined;
-        for (0..NLDM_SIZE) |i| {
-            for (0..NLDM_SIZE) |j| {
-                t.values[i][j] = val;
-            }
-        }
-        return t;
+    pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !NldmTable {
+        const values = try allocator.alloc(f64, rows * cols);
+        @memset(values, 0.0);
+        return .{ .values = values, .rows = rows, .cols = cols };
+    }
+
+    pub fn scalar(allocator: std.mem.Allocator, rows: usize, cols: usize, val: f64) !NldmTable {
+        const values = try allocator.alloc(f64, rows * cols);
+        @memset(values, val);
+        return .{ .values = values, .rows = rows, .cols = cols };
+    }
+
+    pub fn deinit(self: NldmTable, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+    }
+
+    pub fn get(self: NldmTable, row: usize, col: usize) f64 {
+        return self.values[row * self.cols + col];
+    }
+
+    pub fn set(self: *NldmTable, row: usize, col: usize, val: f64) void {
+        self.values[row * self.cols + col] = val;
     }
 };
 
@@ -182,6 +195,9 @@ pub const LibertyCell = struct {
 // Parameters controlling characterization: operating conditions, PDK model
 // paths, and simulation settings.
 
+pub const default_slew_indices = [_]f64{ 0.0100, 0.0230, 0.0531, 0.1233, 0.2830, 0.6497, 1.5000 };
+pub const default_load_indices = [_]f64{ 0.0005, 0.0012, 0.0030, 0.0074, 0.0181, 0.0445, 0.1093 };
+
 pub const LibertyConfig = struct {
     /// Nominal supply voltage (V). sky130 default = 1.8.
     nom_voltage: f64 = 1.8,
@@ -218,9 +234,9 @@ pub const LibertyConfig = struct {
     /// Library name for Liberty header.
     library_name: []const u8 = "spout_analog",
     /// Slew breakpoints for NLDM tables (ns). Sky130 typical values.
-    slew_indices: [NLDM_SIZE]f64 = .{ 0.0100, 0.0230, 0.0531, 0.1233, 0.2830, 0.6497, 1.5000 },
+    slew_indices: []const f64 = &default_slew_indices,
     /// Load breakpoints for NLDM tables (pF). Sky130 typical values.
-    load_indices: [NLDM_SIZE]f64 = .{ 0.0005, 0.0012, 0.0030, 0.0074, 0.0181, 0.0445, 0.1093 },
+    load_indices: []const f64 = &default_load_indices,
 };
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -269,24 +285,68 @@ test "PgPinType asString" {
     try std.testing.expectEqualStrings("pwell", PgPinType.pwell.asString());
 }
 
-test "NldmTable scalar" {
-    const t = NldmTable.scalar(0.05);
-    try std.testing.expectEqual(@as(f64, 0.05), t.values[0][0]);
-    try std.testing.expectEqual(@as(f64, 0.05), t.values[3][4]);
-    try std.testing.expectEqual(@as(f64, 0.05), t.values[6][6]);
+test "NldmTable scalar 7x7 compat" {
+    const allocator = std.testing.allocator;
+    const t = try NldmTable.scalar(allocator, 7, 7, 0.05);
+    defer t.deinit(allocator);
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(0, 0));
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(3, 4));
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(6, 6));
 }
 
 test "TimingArc fields" {
+    const allocator = std.testing.allocator;
+    const cr = try NldmTable.scalar(allocator, 7, 7, 0.05);
+    defer cr.deinit(allocator);
+    const cf = try NldmTable.scalar(allocator, 7, 7, 0.04);
+    defer cf.deinit(allocator);
+    const rt = try NldmTable.scalar(allocator, 7, 7, 0.03);
+    defer rt.deinit(allocator);
+    const ft = try NldmTable.scalar(allocator, 7, 7, 0.02);
+    defer ft.deinit(allocator);
     const arc = TimingArc{
         .related_pin = "A",
         .timing_sense = .negative_unate,
         .timing_type = .combinational,
-        .cell_rise = NldmTable.scalar(0.05),
-        .cell_fall = NldmTable.scalar(0.04),
-        .rise_transition = NldmTable.scalar(0.03),
-        .fall_transition = NldmTable.scalar(0.02),
+        .cell_rise = cr,
+        .cell_fall = cf,
+        .rise_transition = rt,
+        .fall_transition = ft,
     };
     try std.testing.expectEqualStrings("A", arc.related_pin);
     try std.testing.expectEqual(TimingSense.negative_unate, arc.timing_sense);
-    try std.testing.expectEqual(@as(f64, 0.05), arc.cell_rise.values[0][0]);
+    try std.testing.expectEqual(@as(f64, 0.05), arc.cell_rise.get(0, 0));
+}
+
+test "NldmTable init zeroed" {
+    const allocator = std.testing.allocator;
+    const t = try NldmTable.init(allocator, 3, 4);
+    defer t.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), t.rows);
+    try std.testing.expectEqual(@as(usize, 4), t.cols);
+    try std.testing.expectEqual(@as(usize, 12), t.values.len);
+    try std.testing.expectEqual(@as(f64, 0.0), t.get(0, 0));
+    try std.testing.expectEqual(@as(f64, 0.0), t.get(2, 3));
+}
+
+test "NldmTable scalar alloc" {
+    const allocator = std.testing.allocator;
+    const t = try NldmTable.scalar(allocator, 5, 9, 0.05);
+    defer t.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 5), t.rows);
+    try std.testing.expectEqual(@as(usize, 9), t.cols);
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(0, 0));
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(4, 8));
+    try std.testing.expectEqual(@as(f64, 0.05), t.get(2, 5));
+}
+
+test "NldmTable get/set" {
+    const allocator = std.testing.allocator;
+    var t = try NldmTable.init(allocator, 3, 4);
+    defer t.deinit(allocator);
+    t.set(1, 2, 42.0);
+    try std.testing.expectEqual(@as(f64, 42.0), t.get(1, 2));
+    try std.testing.expectEqual(@as(f64, 0.0), t.get(0, 0));
+    t.set(2, 3, 99.0);
+    try std.testing.expectEqual(@as(f64, 99.0), t.get(2, 3));
 }
