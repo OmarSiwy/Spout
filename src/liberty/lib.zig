@@ -72,10 +72,20 @@ pub fn generateLiberty(
     // 3. Run DC operating point for leakage power
     const leakage_nw = try sim_ctx.measureLeakagePower();
 
-    // 4. Run transient sims (7×7 NLDM sweep) for each timing arc
+    // 4. Run transient sims (NxM NLDM sweep) for each timing arc
     const char_result = try sim_ctx.characterizePins(allocator);
     defer {
-        for (char_result.pins) |*p| {
+        for (char_result.pins) |p| {
+            for (p.timing_arcs) |arc| {
+                arc.cell_rise.deinit(allocator);
+                arc.cell_fall.deinit(allocator);
+                arc.rise_transition.deinit(allocator);
+                arc.fall_transition.deinit(allocator);
+            }
+            for (p.internal_power) |pwr| {
+                pwr.rise_power.deinit(allocator);
+                pwr.fall_power.deinit(allocator);
+            }
             allocator.free(p.timing_arcs);
             allocator.free(p.internal_power);
         }
@@ -135,31 +145,43 @@ comptime {
 // ─── Integration test ───────────────────────────────────────────────────────
 
 test "generateLiberty integration: synthetic cell produces valid Liberty" {
-    const alloc = @import("std").testing.allocator;
+    const alloc = std.testing.allocator;
     const NldmTable = types.NldmTable;
     const PgPin = types.PgPin;
-    var buf = @import("std").ArrayList(u8).init(alloc);
+    var buf = std.ArrayList(u8).init(alloc);
     defer buf.deinit();
 
-    // Build a synthetic cell with realistic analog data
+    const cr = try NldmTable.scalar(alloc, 7, 7, 0.045);
+    defer cr.deinit(alloc);
+    const cf = try NldmTable.scalar(alloc, 7, 7, 0.038);
+    defer cf.deinit(alloc);
+    const rt = try NldmTable.scalar(alloc, 7, 7, 0.032);
+    defer rt.deinit(alloc);
+    const ft = try NldmTable.scalar(alloc, 7, 7, 0.028);
+    defer ft.deinit(alloc);
+    const rp = try NldmTable.scalar(alloc, 7, 7, 0.0012);
+    defer rp.deinit(alloc);
+    const fp = try NldmTable.scalar(alloc, 7, 7, 0.0015);
+    defer fp.deinit(alloc);
+
     const timing_arcs = try alloc.alloc(TimingArc, 1);
     defer alloc.free(timing_arcs);
     timing_arcs[0] = .{
         .related_pin = "INP",
         .timing_sense = .negative_unate,
         .timing_type = .combinational,
-        .cell_rise = NldmTable.scalar(0.045),
-        .cell_fall = NldmTable.scalar(0.038),
-        .rise_transition = NldmTable.scalar(0.032),
-        .fall_transition = NldmTable.scalar(0.028),
+        .cell_rise = cr,
+        .cell_fall = cf,
+        .rise_transition = rt,
+        .fall_transition = ft,
     };
 
     const int_power = try alloc.alloc(InternalPower, 1);
     defer alloc.free(int_power);
     int_power[0] = .{
         .related_pin = "INP",
-        .rise_power = NldmTable.scalar(0.0012),
-        .fall_power = NldmTable.scalar(0.0015),
+        .rise_power = rp,
+        .fall_power = fp,
     };
 
     const pg_pins = try alloc.alloc(PgPin, 2);
@@ -184,48 +206,32 @@ test "generateLiberty integration: synthetic cell produces valid Liberty" {
     try writer.writeLiberty(buf.writer(), &cell, config);
 
     const output = buf.items;
+    const testing = std.testing;
 
-    const testing = @import("std").testing;
-
-    // Library structure
     try testing.expect(std.mem.indexOf(u8, output, "library(spout_analog)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "technology (cmos)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "cell(current_mirror)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "area : 125.6") != null);
     try testing.expect(std.mem.indexOf(u8, output, "cell_leakage_power") != null);
-
-    // Voltage map
     try testing.expect(std.mem.indexOf(u8, output, "voltage_map(VDD, 1.80)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "voltage_map(VSS, 0.00)") != null);
-
-    // NLDM table templates
     try testing.expect(std.mem.indexOf(u8, output, "lu_table_template(delay_template_7x7)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "lu_table_template(power_template_7x7)") != null);
-
-    // pg_pin groups
     try testing.expect(std.mem.indexOf(u8, output, "pg_pin(VDD)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "pg_type : primary_power") != null);
     try testing.expect(std.mem.indexOf(u8, output, "pg_pin(VSS)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "pg_type : primary_ground") != null);
-
-    // Signal pins
     try testing.expect(std.mem.indexOf(u8, output, "pin(INP)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "pin(OUT)") != null);
-
-    // NLDM 2D timing
     try testing.expect(std.mem.indexOf(u8, output, "timing()") != null);
     try testing.expect(std.mem.indexOf(u8, output, "related_pin : \"INP\"") != null);
     try testing.expect(std.mem.indexOf(u8, output, "cell_rise(delay_template_7x7)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "cell_fall(delay_template_7x7)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "rise_transition(delay_template_7x7)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "fall_transition(delay_template_7x7)") != null);
-
-    // NLDM 2D power
     try testing.expect(std.mem.indexOf(u8, output, "internal_power()") != null);
     try testing.expect(std.mem.indexOf(u8, output, "rise_power(power_template_7x7)") != null);
     try testing.expect(std.mem.indexOf(u8, output, "fall_power(power_template_7x7)") != null);
-
-    // Operating conditions
     try testing.expect(std.mem.indexOf(u8, output, "nom_voltage : 1.800") != null);
     try testing.expect(std.mem.indexOf(u8, output, "nom_temperature : 25.0") != null);
 }

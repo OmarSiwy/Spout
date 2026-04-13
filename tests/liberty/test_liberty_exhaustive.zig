@@ -22,8 +22,47 @@ const NldmTable = liberty.types.NldmTable;
 // ─── Writer format tests ────────────────────────────────────────────────────
 
 test "Liberty output has correct structure for inverter cell" {
+    const alloc = testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(testing.allocator);
+    defer buf.deinit(alloc);
+
+    const cr = try NldmTable.scalar(alloc, 7, 7, 0.0521);
+    defer cr.deinit(alloc);
+    const cf = try NldmTable.scalar(alloc, 7, 7, 0.0312);
+    defer cf.deinit(alloc);
+    const rt = try NldmTable.scalar(alloc, 7, 7, 0.0456);
+    defer rt.deinit(alloc);
+    const ft = try NldmTable.scalar(alloc, 7, 7, 0.0289);
+    defer ft.deinit(alloc);
+    const rp = try NldmTable.scalar(alloc, 7, 7, 0.00234);
+    defer rp.deinit(alloc);
+    const fp = try NldmTable.scalar(alloc, 7, 7, 0.00187);
+    defer fp.deinit(alloc);
+
+    const timing_arcs = try alloc.alloc(TimingArc, 1);
+    defer alloc.free(timing_arcs);
+    timing_arcs[0] = .{
+        .related_pin = "A",
+        .timing_sense = .negative_unate,
+        .timing_type = .combinational,
+        .cell_rise = cr,
+        .cell_fall = cf,
+        .rise_transition = rt,
+        .fall_transition = ft,
+    };
+
+    const int_power = try alloc.alloc(InternalPower, 1);
+    defer alloc.free(int_power);
+    int_power[0] = .{
+        .related_pin = "A",
+        .rise_power = rp,
+        .fall_power = fp,
+    };
+
+    const pins = try alloc.alloc(LibertyPin, 2);
+    defer alloc.free(pins);
+    pins[0] = .{ .name = "A", .direction = .input, .capacitance = 0.00174, .max_capacitance = 0, .timing_arcs = &.{}, .internal_power = &.{} };
+    pins[1] = .{ .name = "Y", .direction = .output, .capacitance = 0, .max_capacitance = 0.2, .timing_arcs = timing_arcs, .internal_power = int_power };
 
     const cell = LibertyCell{
         .name = "sky130_inv",
@@ -33,43 +72,10 @@ test "Liberty output has correct structure for inverter cell" {
             .{ .name = "VPWR", .pg_type = .primary_power, .voltage_name = "VDD" },
             .{ .name = "VGND", .pg_type = .primary_ground, .voltage_name = "VSS" },
         },
-        .pins = &.{
-            LibertyPin{
-                .name = "A",
-                .direction = .input,
-                .capacitance = 0.00174,
-                .max_capacitance = 0,
-                .timing_arcs = &.{},
-                .internal_power = &.{},
-            },
-            LibertyPin{
-                .name = "Y",
-                .direction = .output,
-                .capacitance = 0,
-                .max_capacitance = 0.2,
-                .timing_arcs = &.{
-                    TimingArc{
-                        .related_pin = "A",
-                        .timing_sense = .negative_unate,
-                        .timing_type = .combinational,
-                        .cell_rise = NldmTable.scalar(0.0521),
-                        .cell_fall = NldmTable.scalar(0.0312),
-                        .rise_transition = NldmTable.scalar(0.0456),
-                        .fall_transition = NldmTable.scalar(0.0289),
-                    },
-                },
-                .internal_power = &.{
-                    InternalPower{
-                        .related_pin = "A",
-                        .rise_power = NldmTable.scalar(0.00234),
-                        .fall_power = NldmTable.scalar(0.00187),
-                    },
-                },
-            },
-        },
+        .pins = pins,
     };
 
-    try liberty.writer.writeLiberty(buf.writer(testing.allocator), &cell, LibertyConfig{});
+    try liberty.writer.writeLiberty(buf.writer(alloc), &cell, LibertyConfig{});
     const out = buf.items;
 
     // Structural checks
@@ -89,8 +95,71 @@ test "Liberty output has correct structure for inverter cell" {
 }
 
 test "Liberty output for multi-input analog cell (OTA)" {
+    const alloc = testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(testing.allocator);
+    defer buf.deinit(alloc);
+
+    // INP arc tables
+    const cr1 = try NldmTable.scalar(alloc, 7, 7, 2.5);
+    defer cr1.deinit(alloc);
+    const cf1 = try NldmTable.scalar(alloc, 7, 7, 3.1);
+    defer cf1.deinit(alloc);
+    const rt1 = try NldmTable.scalar(alloc, 7, 7, 1.8);
+    defer rt1.deinit(alloc);
+    const ft1 = try NldmTable.scalar(alloc, 7, 7, 2.2);
+    defer ft1.deinit(alloc);
+
+    // INM arc tables
+    const cr2 = try NldmTable.scalar(alloc, 7, 7, 2.6);
+    defer cr2.deinit(alloc);
+    const cf2 = try NldmTable.scalar(alloc, 7, 7, 3.0);
+    defer cf2.deinit(alloc);
+    const rt2 = try NldmTable.scalar(alloc, 7, 7, 1.9);
+    defer rt2.deinit(alloc);
+    const ft2 = try NldmTable.scalar(alloc, 7, 7, 2.1);
+    defer ft2.deinit(alloc);
+
+    // Power tables
+    const rp1 = try NldmTable.scalar(alloc, 7, 7, 0.5);
+    defer rp1.deinit(alloc);
+    const fp1 = try NldmTable.scalar(alloc, 7, 7, 0.6);
+    defer fp1.deinit(alloc);
+    const rp2 = try NldmTable.scalar(alloc, 7, 7, 0.5);
+    defer rp2.deinit(alloc);
+    const fp2 = try NldmTable.scalar(alloc, 7, 7, 0.6);
+    defer fp2.deinit(alloc);
+
+    const timing_arcs = try alloc.alloc(TimingArc, 2);
+    defer alloc.free(timing_arcs);
+    timing_arcs[0] = .{
+        .related_pin = "INP",
+        .timing_sense = .positive_unate,
+        .timing_type = .combinational,
+        .cell_rise = cr1,
+        .cell_fall = cf1,
+        .rise_transition = rt1,
+        .fall_transition = ft1,
+    };
+    timing_arcs[1] = .{
+        .related_pin = "INM",
+        .timing_sense = .negative_unate,
+        .timing_type = .combinational,
+        .cell_rise = cr2,
+        .cell_fall = cf2,
+        .rise_transition = rt2,
+        .fall_transition = ft2,
+    };
+
+    const int_power = try alloc.alloc(InternalPower, 2);
+    defer alloc.free(int_power);
+    int_power[0] = .{ .related_pin = "INP", .rise_power = rp1, .fall_power = fp1 };
+    int_power[1] = .{ .related_pin = "INM", .rise_power = rp2, .fall_power = fp2 };
+
+    const pins = try alloc.alloc(LibertyPin, 3);
+    defer alloc.free(pins);
+    pins[0] = .{ .name = "INP", .direction = .input, .capacitance = 0.0032, .max_capacitance = 0, .timing_arcs = &.{}, .internal_power = &.{} };
+    pins[1] = .{ .name = "INM", .direction = .input, .capacitance = 0.0032, .max_capacitance = 0, .timing_arcs = &.{}, .internal_power = &.{} };
+    pins[2] = .{ .name = "VOUT", .direction = .output, .capacitance = 0, .max_capacitance = 1.0, .timing_arcs = timing_arcs, .internal_power = int_power };
 
     const cell = LibertyCell{
         .name = "five_transistor_ota",
@@ -100,57 +169,10 @@ test "Liberty output for multi-input analog cell (OTA)" {
             .{ .name = "VDD", .pg_type = .primary_power, .voltage_name = "VDD" },
             .{ .name = "VSS", .pg_type = .primary_ground, .voltage_name = "VSS" },
         },
-        .pins = &.{
-            LibertyPin{
-                .name = "INP",
-                .direction = .input,
-                .capacitance = 0.0032,
-                .max_capacitance = 0,
-                .timing_arcs = &.{},
-                .internal_power = &.{},
-            },
-            LibertyPin{
-                .name = "INM",
-                .direction = .input,
-                .capacitance = 0.0032,
-                .max_capacitance = 0,
-                .timing_arcs = &.{},
-                .internal_power = &.{},
-            },
-            LibertyPin{
-                .name = "VOUT",
-                .direction = .output,
-                .capacitance = 0,
-                .max_capacitance = 1.0,
-                .timing_arcs = &.{
-                    TimingArc{
-                        .related_pin = "INP",
-                        .timing_sense = .positive_unate,
-                        .timing_type = .combinational,
-                        .cell_rise = NldmTable.scalar(2.5),
-                        .cell_fall = NldmTable.scalar(3.1),
-                        .rise_transition = NldmTable.scalar(1.8),
-                        .fall_transition = NldmTable.scalar(2.2),
-                    },
-                    TimingArc{
-                        .related_pin = "INM",
-                        .timing_sense = .negative_unate,
-                        .timing_type = .combinational,
-                        .cell_rise = NldmTable.scalar(2.6),
-                        .cell_fall = NldmTable.scalar(3.0),
-                        .rise_transition = NldmTable.scalar(1.9),
-                        .fall_transition = NldmTable.scalar(2.1),
-                    },
-                },
-                .internal_power = &.{
-                    InternalPower{ .related_pin = "INP", .rise_power = NldmTable.scalar(0.5), .fall_power = NldmTable.scalar(0.6) },
-                    InternalPower{ .related_pin = "INM", .rise_power = NldmTable.scalar(0.5), .fall_power = NldmTable.scalar(0.6) },
-                },
-            },
-        },
+        .pins = pins,
     };
 
-    try liberty.writer.writeLiberty(buf.writer(testing.allocator), &cell, LibertyConfig{});
+    try liberty.writer.writeLiberty(buf.writer(alloc), &cell, LibertyConfig{});
     const out = buf.items;
 
     // Both timing arcs present
