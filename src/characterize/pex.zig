@@ -174,6 +174,13 @@ pub fn extractFromRoutes(
     // certainly the substrate (VDD/VSS/shorted-internals).  Remap those
     // segments to SUBSTRATE_NET so caps involving them get merged into
     // signal-net substrate caps — matching Magic's substrate-absorption.
+    // Body-net segments are excluded from the count to prevent absorbing
+    // signal nets that share a UF root with body nets.
+    var body_net_set = std.AutoHashMap(u32, void).init(allocator);
+    defer body_net_set.deinit();
+    if (pex_cfg.body_net_ids != null) {
+        for (pex_cfg.body_net_ids.?) |bid| body_net_set.put(bid, {}) catch {};
+    }
     {
         var seen = std.AutoHashMap(u64, void).init(allocator);
         defer seen.deinit();
@@ -181,6 +188,7 @@ pub fn extractFromRoutes(
         defer root_sizes.deinit();
         for (0..n) |i| {
             const orig = routes.net[i].toInt();
+            if (body_net_set.contains(orig)) continue; // skip body segments
             const root = net_map[i];
             const key: u64 = (@as(u64, root) << 32) | orig;
             if ((seen.getOrPut(key) catch continue).found_existing) continue;
