@@ -310,6 +310,12 @@ pub fn runDrcOnSlices(
                         .actual = area_i, .required = min_a,
                         .rect_a = si, .rect_b = si,
                     });
+                    try out.append(allocator, .{
+                        .rule = .min_area, .layer = lyr,
+                        .x = cx, .y = cy,
+                        .actual = area_i, .required = min_a,
+                        .rect_a = si, .rect_b = si,
+                    });
                 }
             }
         } else if (aux_rule_opt) |ai| {
@@ -335,6 +341,12 @@ pub fn runDrcOnSlices(
                     });
                 }
                 if (ar.min_area > 0.0 and (w * h) < ar.min_area - 1e-4) {
+                    try out.append(allocator, .{
+                        .rule = .min_area, .layer = lyr,
+                        .x = cx, .y = cy,
+                        .actual = w * h, .required = ar.min_area,
+                        .rect_a = i, .rect_b = i,
+                    });
                     try out.append(allocator, .{
                         .rule = .min_area, .layer = lyr,
                         .x = cx, .y = cy,
@@ -539,17 +551,16 @@ pub fn runDrcOnSlices(
                 side_best[3] = @max(side_best[3], oy1 - iy1); // top
             }
 
-            // Skip shapes where inner type is not inside outer type.
-            // Only applies to rules where inner may legitimately exist
-            // outside outer (e.g. P-taps outside nwell for diff/tap.10,
-            // poly-licons outside diff for licon.5a).  For metal/via
-            // rules, missing overlap means a genuine enclosure failure
-            // (all 4 sides fail).
+            // Only skip when inner shape has no business being inside outer.
+            // For nwell enclosure (outer=64, diff/tap.10): skip if tap is not
+            // inside ANY nwell — it may legitimately be in a P-epi region.
+            // For diff enclosure (outer=65, licon.5a): skip if licon is not
+            // inside ANY diff — may be inside nwell instead.
+            // For metal/via rules (outer=67/68/69): never skip.
             if (!has_overlap) {
-                // Device rules: inner on non-routing layer without outer overlap → skip
-                // Metal/via rules: inner on contact/via without outer overlap → count
-                const is_device_rule = (rule.outer_layer == 64 or rule.outer_layer == 65);
-                if (is_device_rule) continue;
+                const should_skip = (rule.outer_layer == 64 and side_best[0] < 0 and side_best[1] < 0 and side_best[2] < 0 and side_best[3] < 0) or
+                                    (rule.outer_layer == 65 and side_best[0] < 0 and side_best[1] < 0 and side_best[2] < 0 and side_best[3] < 0);
+                if (should_skip) continue;
             }
 
             // MAGIC checks each side independently ("in one direction")
