@@ -91,6 +91,7 @@ pub const ParseResult = struct {
     pins: []PinEdge,
     adj: FlatAdjList,
     subcircuits: []Subcircuit,
+    globals: []const []const u8,
     allocator: std.mem.Allocator,
     net_table: std.StringHashMap(NetIdx),
 
@@ -115,6 +116,10 @@ pub const ParseResult = struct {
             self.allocator.free(s.ports);
         }
         self.allocator.free(self.subcircuits);
+        for (self.globals) |g| {
+            if (g.len > 0) self.allocator.free(g);
+        }
+        self.allocator.free(self.globals);
         self.net_table.deinit();
     }
 

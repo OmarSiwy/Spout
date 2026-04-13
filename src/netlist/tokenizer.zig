@@ -343,6 +343,7 @@ pub const Tokenizer = struct {
     net_is_power: std.ArrayList(bool),
     pins: std.ArrayList(PinEdge),
     subcircuits: std.ArrayList(Subcircuit),
+    globals: std.ArrayList([]const u8),
     net_table: std.StringHashMap(NetIdx),
     pin_count: u32,
 
@@ -357,6 +358,7 @@ pub const Tokenizer = struct {
             .net_is_power = .empty,
             .pins = .empty,
             .subcircuits = .empty,
+            .globals = .empty,
             .net_table = std.StringHashMap(NetIdx).init(allocator),
             .pin_count = 0,
         };
@@ -371,6 +373,7 @@ pub const Tokenizer = struct {
         self.net_is_power.deinit(self.allocator);
         self.pins.deinit(self.allocator);
         self.subcircuits.deinit(self.allocator);
+        self.globals.deinit(self.allocator);
         self.net_table.deinit();
     }
 
@@ -602,7 +605,8 @@ pub const Tokenizer = struct {
                 .subckt_begin => try self.parseSubcktBegin(&stmt),
                 .subckt_end   => self.parseSubcktEnd(),
                 .subckt_inst  => try self.parseSubcktInst(&stmt),
-                .dot_param, .dot_global, .dot_model, .dot_include, .dot_lib => {},
+                .dot_global => try self.parseGlobal(&stmt),
+                .dot_param, .dot_model, .dot_include, .dot_lib => {},
                 .source, .comment, .blank, .other => {},
             }
         }
@@ -877,6 +881,13 @@ pub const Tokenizer = struct {
         for (ports_owned) |port| _ = try self.internNet(port);
     }
 
+    fn parseGlobal(self: *Tokenizer, stmt: *const Token) !void {
+        // .global net1 [net2 ...]
+        for (stmt.tokens[1..]) |name| {
+            try self.globals.append(self.allocator, try self.allocator.dupe(u8, name));
+        }
+    }
+
     fn parseSubcktEnd(self: *Tokenizer) void {
         const n = self.subcircuits.items.len;
         if (n > 0) {
@@ -1000,12 +1011,15 @@ pub const Tokenizer = struct {
         var it = self.net_table.iterator();
         while (it.next()) |entry| try net_table.put(entry.key_ptr.*, entry.value_ptr.*);
 
+        const globals = try self.allocator.dupe([]const u8, self.globals.items);
+
         return ParseResult{
             .devices = devices,
             .nets = nets,
             .pins = pins,
             .adj = .{ .row_ptr = row_ptr, .col_idx = col_idx, .num_nets = num_nets },
             .subcircuits = subcircuits,
+            .globals = globals,
             .allocator = self.allocator,
             .net_table = net_table,
         };
