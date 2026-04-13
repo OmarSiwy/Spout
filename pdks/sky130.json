@@ -32,7 +32,9 @@
     {"outer_layer": 69, "outer_datatype": 20, "inner_layer": 69, "inner_datatype": 44, "enclosure": 0.055},
     {"outer_layer": 67, "outer_datatype": 20, "inner_layer": 66, "inner_datatype": 44, "enclosure": 0.08},
     {"outer_layer": 64, "outer_datatype": 20, "inner_layer": 65, "inner_datatype": 44, "enclosure": 0.18},
-    {"outer_layer": 65, "outer_datatype": 20, "inner_layer": 66, "inner_datatype": 44, "enclosure": 0.04}
+    {"outer_layer": 65, "outer_datatype": 20, "inner_layer": 66, "inner_datatype": 44, "enclosure": 0.04},
+    {"outer_layer": 68, "outer_datatype": 20, "inner_layer": 66, "inner_datatype": 44, "enclosure": 0.06},
+    {"outer_layer": 65, "outer_datatype": 20, "inner_layer": 66, "inner_datatype": 44, "enclosure": 0.12}
   ],
   "cross_rules": [
     {"layer_a": 66, "datatype_a": 20, "layer_b": 65, "datatype_b": 20, "min_spacing": 0.075},
