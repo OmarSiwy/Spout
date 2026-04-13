@@ -172,6 +172,7 @@ pub fn runDrcOnSlices(
     var out: std.ArrayListUnmanaged(DrcViolation) = .{};
     errdefer out.deinit(allocator);
 
+    _ = net; // MAGIC DRC is purely geometric; net info unused.
     if (len == 0) return out.toOwnedSlice(allocator);
 
     // ── Collect unique (GDS layer, GDS datatype) pairs present ───────────────
@@ -358,7 +359,6 @@ pub fn runDrcOnSlices(
             const ai = idx[k];
             const ax0 = x_min[ai]; const ay0 = y_min[ai];
             const ax1 = x_max[ai]; const ay1 = y_max[ai];
-            const an  = net[ai].toInt();
             const acx = (ax0 + ax1) * 0.5;
             const acy = (ay0 + ay1) * 0.5;
 
@@ -368,12 +368,10 @@ pub fn runDrcOnSlices(
 
                 const bx0 = x_min[bi]; const by0 = y_min[bi];
                 const bx1 = x_max[bi]; const by1 = y_max[bi];
-                const bn  = net[bi].toInt();
                 const bcx = (bx0 + bx1) * 0.5;
                 const bcy = (by0 + by1) * 0.5;
 
                 const gap = projGap(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1);
-                const NONE: u32 = std.math.maxInt(u32);
 
                 // MAGIC counts per-edge: each shape in a violating pair gets
                 // its own error tile.  Emit two violations per pair (one
@@ -394,51 +392,22 @@ pub fn runDrcOnSlices(
                             .rect_a = bi, .rect_b = ai,
                         });
                     }
-                } else if (an == NONE or bn == NONE) {
-                    if (min_sp > 0.0 and gap > 1e-7 and gap < min_sp - 1e-7) {
-                        try out.append(allocator, .{
-                            .rule = .min_spacing, .layer = @truncate(layer),
-                            .x = acx, .y = acy,
-                            .actual = gap, .required = min_sp,
-                            .rect_a = ai, .rect_b = bi,
-                        });
-                        try out.append(allocator, .{
-                            .rule = .min_spacing, .layer = @truncate(layer),
-                            .x = bcx, .y = bcy,
-                            .actual = gap, .required = min_sp,
-                            .rect_a = bi, .rect_b = ai,
-                        });
-                    }
-                } else if (an != bn) {
-                    // MAGIC DRC merges overlapping same-layer paint into
-                    // one region; overlaps are not "shorts" at DRC level.
-                    // Only flag positive-gap spacing violations.
-                    if (min_sp > 0.0 and gap > 1e-7 and gap < min_sp - 1e-7) {
-                        try out.append(allocator, .{
-                            .rule = .min_spacing, .layer = @truncate(layer),
-                            .x = acx, .y = acy,
-                            .actual = gap, .required = min_sp,
-                            .rect_a = ai, .rect_b = bi,
-                        });
-                        try out.append(allocator, .{
-                            .rule = .min_spacing, .layer = @truncate(layer),
-                            .x = bcx, .y = bcy,
-                            .actual = gap, .required = min_sp,
-                            .rect_a = bi, .rect_b = ai,
-                        });
-                    }
                 } else {
-                    if (sn_sp > 0.0 and gap >= 0.0 and gap < sn_sp - 1e-7) {
+                    // MAGIC DRC is purely geometric — no net concept.
+                    // All same-layer pairs use min_spacing regardless of
+                    // net assignment.  Overlapping paint (gap < 0) is
+                    // merged in MAGIC's tile plane; skip silently.
+                    if (min_sp > 0.0 and gap > 1e-7 and gap < min_sp - 1e-7) {
                         try out.append(allocator, .{
-                            .rule = .notch, .layer = @truncate(layer),
+                            .rule = .min_spacing, .layer = @truncate(layer),
                             .x = acx, .y = acy,
-                            .actual = gap, .required = sn_sp,
+                            .actual = gap, .required = min_sp,
                             .rect_a = ai, .rect_b = bi,
                         });
                         try out.append(allocator, .{
-                            .rule = .notch, .layer = @truncate(layer),
+                            .rule = .min_spacing, .layer = @truncate(layer),
                             .x = bcx, .y = bcy,
-                            .actual = gap, .required = sn_sp,
+                            .actual = gap, .required = min_sp,
                             .rect_a = bi, .rect_b = ai,
                         });
                     }
