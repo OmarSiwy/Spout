@@ -1,28 +1,5 @@
 ### Liberty Generation TODO
 
-#### NLDM Table Size: Configurable NxN
-
-Current: fixed 7x7 (`NLDM_SIZE = 7` in types.zig). With fast SPICE, larger tables are feasible.
-
-To make configurable:
-- Change `NLDM_SIZE` from comptime constant to runtime parameter
-- `NldmTable` becomes heap-allocated with dynamic dimensions
-- `LibertyConfig.slew_indices` / `load_indices` become slices instead of `[7]f64`
-- Writer reads actual slice length instead of hardcoding `NLDM_SIZE`
-- Template name changes dynamically (e.g. `delay_template_11x11`)
-- spice_sim sweep loops already use `config.slew_indices` length
-
-Suggested sizes:
-- 7x7: standard (current, matches sky130 PDK libs)
-- 11x11: high accuracy for fast SPICE
-- 15x15: maximum density for critical analog cells
-- Asymmetric (e.g. 7x11): fewer slew points, more load points
-
-Additional slew/load breakpoints for larger tables:
-- Extend slew range: 0.005ns to 2.0ns
-- Extend load range: 0.0002pF to 0.5pF
-- Use log-spacing for even coverage
-
 #### Volare PDK Corner Support
 
 Expand `CornerSpec` / `sky130_corners` to support any volare-managed PDK, not just sky130.
@@ -80,3 +57,4 @@ Validate Liberty timing accuracy against actual SPICE transient sweeps using an 
 - [x] `voltage_map` at library level
 - [x] NLDM 2D tables (7x7 slew x load) replacing scalar values
 - [x] `lu_table_template` definitions at library level
+- [x] NLDM table size: configurable NxM (asymmetric) with flat heap-allocated storage
