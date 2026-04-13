@@ -410,20 +410,10 @@ pub fn runDrcOnSlices(
                         });
                     }
                 } else if (an != bn) {
-                    if (gap < -1e-7) {
-                        try out.append(allocator, .{
-                            .rule = .short, .layer = @truncate(layer),
-                            .x = acx, .y = acy,
-                            .actual = gap, .required = 0.0,
-                            .rect_a = ai, .rect_b = bi,
-                        });
-                        try out.append(allocator, .{
-                            .rule = .short, .layer = @truncate(layer),
-                            .x = bcx, .y = bcy,
-                            .actual = gap, .required = 0.0,
-                            .rect_a = bi, .rect_b = ai,
-                        });
-                    } else if (min_sp > 0.0 and gap < min_sp - 1e-7) {
+                    // MAGIC DRC merges overlapping same-layer paint into
+                    // one region; overlaps are not "shorts" at DRC level.
+                    // Only flag positive-gap spacing violations.
+                    if (min_sp > 0.0 and gap > 1e-7 and gap < min_sp - 1e-7) {
                         try out.append(allocator, .{
                             .rule = .min_spacing, .layer = @truncate(layer),
                             .x = acx, .y = acy,
@@ -704,9 +694,9 @@ test "DRC min_spacing violation on M1" {
     try testing.expectApproxEqAbs(@as(f32, 0.14), viols[0].required, 1e-5);
 }
 
-test "DRC short violation between different nets on M1" {
+test "DRC overlapping different-net rects produce no violation (merged paint)" {
     // Two M1 rects from different nets that overlap.
-    // KLayout DRC (sky130A): 1 short violation.
+    // MAGIC DRC merges overlapping same-layer paint → no short/spacing violation.
     const pdk = PdkConfig.loadDefault(.sky130);
     var s = try makeShapes(testing.allocator, &.{
         .{ .x0 = 0.0, .y0 = 0.0, .x1 = 1.0, .y1 = 0.5, .lyr = 68, .net = 0 },
@@ -715,10 +705,7 @@ test "DRC short violation between different nets on M1" {
     defer s.deinit();
     const viols = try runDrc(&s, &pdk, testing.allocator);
     defer testing.allocator.free(viols);
-    try testing.expectEqual(@as(usize, 2), viols.len);
-    try testing.expectEqual(DrcRule.short, viols[0].rule);
-    try testing.expectEqual(DrcRule.short, viols[1].rule);
-    try testing.expect(viols[0].actual < 0.0);
+    try testing.expectEqual(@as(usize, 0), viols.len);
 }
 
 test "DRC same-net overlap is not a short" {
@@ -911,8 +898,8 @@ test "DRC violation rule indices rect_a < rect_b for each pair" {
     try testing.expectEqual(viols[0].rect_b, viols[1].rect_a);
 }
 
-test "DRC short violation actual is negative" {
-    // Overlap = negative gap → actual < 0.
+test "DRC overlapping different-net rects no violation (larger overlap)" {
+    // Overlap with larger negative gap — still no violation (merged paint).
     const pdk = PdkConfig.loadDefault(.sky130);
     var s = try makeShapes(testing.allocator, &.{
         .{ .x0 = 0.0, .y0 = 0.0, .x1 = 1.0, .y1 = 0.5, .lyr = 68, .net = 0 },
@@ -921,7 +908,5 @@ test "DRC short violation actual is negative" {
     defer s.deinit();
     const viols = try runDrc(&s, &pdk, testing.allocator);
     defer testing.allocator.free(viols);
-    try testing.expectEqual(@as(usize, 2), viols.len);
-    try testing.expect(viols[0].actual < 0.0);
-    try testing.expect(viols[1].actual < 0.0);
+    try testing.expectEqual(@as(usize, 0), viols.len);
 }
