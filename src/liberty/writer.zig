@@ -32,7 +32,6 @@ const TimingArc = types.TimingArc;
 const InternalPower = types.InternalPower;
 const PgPin = types.PgPin;
 const NldmTable = types.NldmTable;
-const NLDM_SIZE = types.NLDM_SIZE;
 
 // ─── Main writer ────────────────────────────────────────────────────────────
 
@@ -57,8 +56,10 @@ pub fn writeLiberty(out: anytype, cell: *const LibertyCell, config: LibertyConfi
     try out.writeAll("  voltage_map(VSS, 0.00);\n\n");
 
     // NLDM table templates
-    try writeTableTemplate(out, "delay_template_7x7", &config.slew_indices, &config.load_indices);
-    try writeTableTemplate(out, "power_template_7x7", &config.slew_indices, &config.load_indices);
+    const slew_len = config.slew_indices.len;
+    const load_len = config.load_indices.len;
+    try writeTableTemplate(out, "delay_template_", slew_len, load_len, config.slew_indices, config.load_indices);
+    try writeTableTemplate(out, "power_template_", slew_len, load_len, config.slew_indices, config.load_indices);
 
     // Operating conditions
     try out.print("  operating_conditions(\"{s}\") {{\n", .{config.nom_process});
@@ -81,15 +82,15 @@ pub fn writeLiberty(out: anytype, cell: *const LibertyCell, config: LibertyConfi
 
     // Signal pins
     for (cell.pins) |pin| {
-        try writePin(out, &pin);
+        try writePin(out, &pin, config);
     }
 
     try out.writeAll("  }\n"); // end cell
     try out.writeAll("}\n"); // end library
 }
 
-fn writeTableTemplate(out: anytype, name: []const u8, index_1: []const f64, index_2: []const f64) !void {
-    try out.print("  lu_table_template({s}) {{\n", .{name});
+fn writeTableTemplate(out: anytype, prefix: []const u8, slew_len: usize, load_len: usize, index_1: []const f64, index_2: []const f64) !void {
+    try out.print("  lu_table_template({s}{d}x{d}) {{\n", .{ prefix, slew_len, load_len });
     try out.writeAll("    variable_1 : input_net_transition;\n");
     try out.writeAll("    variable_2 : total_output_net_capacitance;\n");
     try writeIndexLine(out, "    index_1", index_1);
@@ -113,7 +114,7 @@ fn writePgPin(out: anytype, pg: *const PgPin) !void {
     try out.writeAll("    }\n");
 }
 
-fn writePin(out: anytype, pin: *const LibertyPin) !void {
+fn writePin(out: anytype, pin: *const LibertyPin, config: LibertyConfig) !void {
     try out.print("    pin({s}) {{\n", .{pin.name});
     try out.print("      direction : {s};\n", .{pin.direction.asString()});
 
@@ -124,20 +125,26 @@ fn writePin(out: anytype, pin: *const LibertyPin) !void {
         try out.print("      max_capacitance : {d:.6};\n", .{pin.max_capacitance});
     }
 
+    // Build template names from config dimensions
+    var delay_buf: [64]u8 = undefined;
+    const delay_tpl = std.fmt.bufPrint(&delay_buf, "delay_template_{d}x{d}", .{ config.slew_indices.len, config.load_indices.len }) catch "delay_template_7x7";
+    var power_buf: [64]u8 = undefined;
+    const power_tpl = std.fmt.bufPrint(&power_buf, "power_template_{d}x{d}", .{ config.slew_indices.len, config.load_indices.len }) catch "power_template_7x7";
+
     // Timing arcs
     for (pin.timing_arcs) |arc| {
-        try writeTimingArc(out, &arc);
+        try writeTimingArc(out, &arc, delay_tpl);
     }
 
     // Internal power
     for (pin.internal_power) |pwr| {
-        try writeInternalPower(out, &pwr);
+        try writeInternalPower(out, &pwr, power_tpl);
     }
 
     try out.writeAll("    }\n"); // end pin
 }
 
-fn writeTimingArc(out: anytype, arc: *const TimingArc) !void {
+fn writeTimingArc(out: anytype, arc: *const TimingArc, delay_tpl: []const u8) !void {
     try out.writeAll("      timing() {\n");
     try out.print("        related_pin : \"{s}\";\n", .{arc.related_pin});
     if (arc.related_power_pin) |pp| {
@@ -149,23 +156,23 @@ fn writeTimingArc(out: anytype, arc: *const TimingArc) !void {
     try out.print("        timing_sense : {s};\n", .{arc.timing_sense.asString()});
     try out.print("        timing_type : {s};\n", .{arc.timing_type.asString()});
 
-    try writeNldmBlock(out, "cell_rise", "delay_template_7x7", &arc.cell_rise);
-    try writeNldmBlock(out, "cell_fall", "delay_template_7x7", &arc.cell_fall);
-    try writeNldmBlock(out, "rise_transition", "delay_template_7x7", &arc.rise_transition);
-    try writeNldmBlock(out, "fall_transition", "delay_template_7x7", &arc.fall_transition);
+    try writeNldmBlock(out, "cell_rise", delay_tpl, &arc.cell_rise);
+    try writeNldmBlock(out, "cell_fall", delay_tpl, &arc.cell_fall);
+    try writeNldmBlock(out, "rise_transition", delay_tpl, &arc.rise_transition);
+    try writeNldmBlock(out, "fall_transition", delay_tpl, &arc.fall_transition);
 
     try out.writeAll("      }\n"); // end timing
 }
 
-fn writeInternalPower(out: anytype, pwr: *const InternalPower) !void {
+fn writeInternalPower(out: anytype, pwr: *const InternalPower, power_tpl: []const u8) !void {
     try out.writeAll("      internal_power() {\n");
     try out.print("        related_pin : \"{s}\";\n", .{pwr.related_pin});
     if (pwr.related_pg_pin) |pg| {
         try out.print("        related_pg_pin : \"{s}\";\n", .{pg});
     }
 
-    try writeNldmBlock(out, "rise_power", "power_template_7x7", &pwr.rise_power);
-    try writeNldmBlock(out, "fall_power", "power_template_7x7", &pwr.fall_power);
+    try writeNldmBlock(out, "rise_power", power_tpl, &pwr.rise_power);
+    try writeNldmBlock(out, "fall_power", power_tpl, &pwr.fall_power);
 
     try out.writeAll("      }\n"); // end internal_power
 }
@@ -173,13 +180,13 @@ fn writeInternalPower(out: anytype, pwr: *const InternalPower) !void {
 fn writeNldmBlock(out: anytype, name: []const u8, template: []const u8, table: *const NldmTable) !void {
     try out.print("        {s}({s}) {{\n", .{ name, template });
     try out.writeAll("          values (\n");
-    for (0..NLDM_SIZE) |i| {
+    for (0..table.rows) |i| {
         try out.writeAll("            \"");
-        for (0..NLDM_SIZE) |j| {
+        for (0..table.cols) |j| {
             if (j > 0) try out.writeAll(", ");
-            try out.print("{d:.6}", .{table.values[i][j]});
+            try out.print("{d:.6}", .{table.get(i, j)});
         }
-        if (i < NLDM_SIZE - 1) {
+        if (i < table.rows - 1) {
             try out.writeAll("\",\n");
         } else {
             try out.writeAll("\"\n");
@@ -193,8 +200,22 @@ fn writeNldmBlock(out: anytype, name: []const u8, template: []const u8, table: *
 
 test "writeLiberty minimal cell" {
     const PgPinType = types.PgPinType;
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(alloc);
     defer buf.deinit();
+
+    const cr = try NldmTable.scalar(alloc, 7, 7, 0.05);
+    defer cr.deinit(alloc);
+    const cf = try NldmTable.scalar(alloc, 7, 7, 0.04);
+    defer cf.deinit(alloc);
+    const rt = try NldmTable.scalar(alloc, 7, 7, 0.03);
+    defer rt.deinit(alloc);
+    const ft = try NldmTable.scalar(alloc, 7, 7, 0.02);
+    defer ft.deinit(alloc);
+    const rp = try NldmTable.scalar(alloc, 7, 7, 0.001);
+    defer rp.deinit(alloc);
+    const fp = try NldmTable.scalar(alloc, 7, 7, 0.002);
+    defer fp.deinit(alloc);
 
     const cell = LibertyCell{
         .name = "test_inv",
@@ -223,17 +244,17 @@ test "writeLiberty minimal cell" {
                         .related_pin = "A",
                         .timing_sense = .negative_unate,
                         .timing_type = .combinational,
-                        .cell_rise = NldmTable.scalar(0.05),
-                        .cell_fall = NldmTable.scalar(0.04),
-                        .rise_transition = NldmTable.scalar(0.03),
-                        .fall_transition = NldmTable.scalar(0.02),
+                        .cell_rise = cr,
+                        .cell_fall = cf,
+                        .rise_transition = rt,
+                        .fall_transition = ft,
                     },
                 },
                 .internal_power = &.{
                     InternalPower{
                         .related_pin = "A",
-                        .rise_power = NldmTable.scalar(0.001),
-                        .fall_power = NldmTable.scalar(0.002),
+                        .rise_power = rp,
+                        .fall_power = fp,
                     },
                 },
             },
@@ -306,4 +327,59 @@ test "writeLiberty pg_pin only cell" {
     try std.testing.expect(std.mem.indexOf(u8, output, "pg_type : primary_ground") != null);
     // No signal pins or timing arcs
     try std.testing.expect(std.mem.indexOf(u8, output, "timing()") == null);
+}
+
+test "writeLiberty dynamic template name 11x11" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(alloc);
+    defer buf.deinit();
+
+    const slew_11 = [_]f64{ 0.005, 0.010, 0.020, 0.040, 0.080, 0.160, 0.320, 0.640, 1.000, 1.500, 2.000 };
+    const load_11 = [_]f64{ 0.0002, 0.0005, 0.0012, 0.0030, 0.0074, 0.0181, 0.0445, 0.1000, 0.2000, 0.3500, 0.5000 };
+
+    var config = LibertyConfig{};
+    config.slew_indices = &slew_11;
+    config.load_indices = &load_11;
+
+    const cell = LibertyCell{
+        .name = "test_11x11",
+        .area = 1.0,
+        .leakage_power = 0.0,
+        .pg_pins = &.{},
+        .pins = &.{},
+    };
+
+    try writeLiberty(buf.writer(), &cell, config);
+    const output = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(delay_template_11x11)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(power_template_11x11)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "7x7") == null);
+}
+
+test "writeLiberty asymmetric template name 5x9" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(alloc);
+    defer buf.deinit();
+
+    const slew_5 = [_]f64{ 0.01, 0.05, 0.10, 0.50, 1.00 };
+    const load_9 = [_]f64{ 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.08, 0.10 };
+
+    var config = LibertyConfig{};
+    config.slew_indices = &slew_5;
+    config.load_indices = &load_9;
+
+    const cell = LibertyCell{
+        .name = "test_asym",
+        .area = 1.0,
+        .leakage_power = 0.0,
+        .pg_pins = &.{},
+        .pins = &.{},
+    };
+
+    try writeLiberty(buf.writer(), &cell, config);
+    const output = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(delay_template_5x9)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(power_template_5x9)") != null);
 }
