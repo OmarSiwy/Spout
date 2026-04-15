@@ -33,6 +33,39 @@ const InternalPower = types.InternalPower;
 const PgPin = types.PgPin;
 const NldmTable = types.NldmTable;
 
+// ─── Timing sense inference ─────────────────────────────────────────────────
+
+/// Infer timing sense from SPICE netlist text by counting inversion stages.
+///
+/// Heuristic approach:
+///   - If the netlist text contains "inv" or "INV" (case-insensitive fragment),
+///     the path is assumed inverting → `negative_unate`.
+///   - Otherwise the conservative safe default `non_unate` is returned.
+///
+/// The function is intentionally conservative: when analysis is ambiguous it
+/// always returns `non_unate` so that downstream timing analysis tools do not
+/// make incorrect unate assumptions.
+///
+/// `input_pin` and `output_pin` are accepted for future full topology tracing
+/// but are currently unused in this heuristic implementation.
+pub fn inferTimingSense(
+    netlist_text: []const u8,
+    input_pin: []const u8,
+    output_pin: []const u8,
+) types.TimingSense {
+    _ = input_pin;
+    _ = output_pin;
+    // Case-sensitive scan for both lowercase and uppercase variants —
+    // avoids allocating a lowercased copy while still catching common spellings.
+    if (std.mem.indexOf(u8, netlist_text, "inv") != null or
+        std.mem.indexOf(u8, netlist_text, "INV") != null or
+        std.mem.indexOf(u8, netlist_text, "Inv") != null)
+    {
+        return .negative_unate;
+    }
+    return .non_unate;
+}
+
 // ─── Main writer ────────────────────────────────────────────────────────────
 
 pub fn writeLiberty(out: anytype, cell: *const LibertyCell, config: LibertyConfig) !void {
@@ -201,8 +234,8 @@ fn writeNldmBlock(out: anytype, name: []const u8, template: []const u8, table: *
 test "writeLiberty minimal cell" {
     const PgPinType = types.PgPinType;
     const alloc = std.testing.allocator;
-    var buf = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     const cr = try NldmTable.scalar(alloc, 7, 7, 0.05);
     defer cr.deinit(alloc);
@@ -262,7 +295,7 @@ test "writeLiberty minimal cell" {
     };
 
     const config = LibertyConfig{};
-    try writeLiberty(buf.writer(), &cell, config);
+    try writeLiberty(buf.writer(alloc), &cell, config);
 
     const output = buf.items;
 
@@ -303,8 +336,9 @@ test "writeLiberty minimal cell" {
 
 test "writeLiberty pg_pin only cell" {
     const PgPinType = types.PgPinType;
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
-    defer buf.deinit();
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     const cell = LibertyCell{
         .name = "pwr_cell",
@@ -317,7 +351,7 @@ test "writeLiberty pg_pin only cell" {
         .pins = &.{},
     };
 
-    try writeLiberty(buf.writer(), &cell, LibertyConfig{});
+    try writeLiberty(buf.writer(alloc), &cell, LibertyConfig{});
     const output = buf.items;
 
     // pg_pin groups present
@@ -331,8 +365,8 @@ test "writeLiberty pg_pin only cell" {
 
 test "writeLiberty dynamic template name 11x11" {
     const alloc = std.testing.allocator;
-    var buf = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     const slew_11 = [_]f64{ 0.005, 0.010, 0.020, 0.040, 0.080, 0.160, 0.320, 0.640, 1.000, 1.500, 2.000 };
     const load_11 = [_]f64{ 0.0002, 0.0005, 0.0012, 0.0030, 0.0074, 0.0181, 0.0445, 0.1000, 0.2000, 0.3500, 0.5000 };
@@ -349,7 +383,7 @@ test "writeLiberty dynamic template name 11x11" {
         .pins = &.{},
     };
 
-    try writeLiberty(buf.writer(), &cell, config);
+    try writeLiberty(buf.writer(alloc), &cell, config);
     const output = buf.items;
 
     try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(delay_template_11x11)") != null);
@@ -359,8 +393,8 @@ test "writeLiberty dynamic template name 11x11" {
 
 test "writeLiberty asymmetric template name 5x9" {
     const alloc = std.testing.allocator;
-    var buf = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     const slew_5 = [_]f64{ 0.01, 0.05, 0.10, 0.50, 1.00 };
     const load_9 = [_]f64{ 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.08, 0.10 };
@@ -377,7 +411,7 @@ test "writeLiberty asymmetric template name 5x9" {
         .pins = &.{},
     };
 
-    try writeLiberty(buf.writer(), &cell, config);
+    try writeLiberty(buf.writer(alloc), &cell, config);
     const output = buf.items;
 
     try std.testing.expect(std.mem.indexOf(u8, output, "lu_table_template(delay_template_5x9)") != null);

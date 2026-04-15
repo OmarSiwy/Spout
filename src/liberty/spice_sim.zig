@@ -26,6 +26,50 @@ const TimingType = types.TimingType;
 const PgPin = types.PgPin;
 const PgPinType = types.PgPinType;
 const NldmTable = types.NldmTable;
+const writer_mod = @import("writer.zig");
+
+// ─── Simulation errors ──────────────────────────────────────────────────────
+
+pub const SimError = error{
+    /// `ngspice` binary not found or returned a non-zero exit code.
+    NgspiceNotFound,
+    /// ngspice ran but reported a convergence failure.
+    SimulationFailed,
+    /// A required .measure result was absent in ngspice output.
+    MeasureNotFound,
+    /// GDS or SPICE input file does not exist or cannot be accessed.
+    InputFileNotFound,
+};
+
+/// Verify that `ngspice` is on PATH and responds to `--version`.
+/// Returns `SimError.NgspiceNotFound` if it cannot be found or fails.
+pub fn checkNgspiceAvailable(allocator: std.mem.Allocator) SimError!void {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "ngspice", "--version" },
+        .max_output_bytes = 4096,
+    }) catch return SimError.NgspiceNotFound;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return SimError.NgspiceNotFound,
+        else => return SimError.NgspiceNotFound,
+    }
+}
+
+/// Parse a named value from ngspice output, returning `fallback` and logging
+/// a warning when the key is absent (e.g. due to convergence failure).
+fn parseMeasureWithFallback(
+    output: []const u8,
+    key: []const u8,
+    fallback: f64,
+) f64 {
+    const val = parseNamedValue(output, key);
+    if (val == null) {
+        std.log.warn("liberty: measure '{s}' not found in ngspice output — using fallback {d:.6}", .{ key, fallback });
+    }
+    return val orelse fallback;
+}
 
 // ─── Port classification ────────────────────────────────────────────────────
 
@@ -88,8 +132,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 // ─── SPICE netlist parser (minimal) ─────────────────────────────────────────
 
 fn parseSubcktPorts(allocator: std.mem.Allocator, spice_content: []const u8, cell_name: []const u8) ![]PortInfo {
-    var ports = std.ArrayList(PortInfo).init(allocator);
-    errdefer ports.deinit();
+    var ports: std.ArrayList(PortInfo) = .empty;
+    errdefer ports.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, spice_content, '\n');
     while (lines.next()) |line| {
@@ -104,12 +148,12 @@ fn parseSubcktPorts(allocator: std.mem.Allocator, spice_content: []const u8, cel
         while (tokens.next()) |tok| {
             if (std.mem.indexOfScalar(u8, tok, '=') != null) break;
             if (tok[0] == '*' or tok[0] == '$') break;
-            try ports.append(.{ .name = tok, .role = classifyPort(tok) });
+            try ports.append(allocator, .{ .name = tok, .role = classifyPort(tok) });
         }
         break;
     }
 
-    return ports.toOwnedSlice();
+    return ports.toOwnedSlice(allocator);
 }
 
 // ─── Simulation context ─────────────────────────────────────────────────────
@@ -127,6 +171,9 @@ pub const SimContext = struct {
         cell_name: []const u8,
         config: LibertyConfig,
     ) !SimContext {
+        // Validate that the SPICE input file exists before proceeding.
+        std.fs.cwd().access(spice_path, .{}) catch return SimError.InputFileNotFound;
+
         const file = try std.fs.cwd().openFile(spice_path, .{});
         defer file.close();
         const stat = try file.stat();
@@ -154,9 +201,9 @@ pub const SimContext = struct {
 
     /// Run DC operating point to measure leakage power (nW).
     pub fn measureLeakagePower(self: *SimContext) !f64 {
-        var deck = std.ArrayList(u8).init(self.allocator);
-        defer deck.deinit();
-        const w = deck.writer();
+        var deck: std.ArrayList(u8) = .empty;
+        defer deck.deinit(self.allocator);
+        const w = deck.writer(self.allocator);
 
         try self.writeDeckHeader(w);
 
@@ -182,7 +229,7 @@ pub const SimContext = struct {
         const output = try self.runNgspice(deck.items);
         defer self.allocator.free(output);
 
-        const i_leak = parseNamedValue(output, "MEAS_LEAK=") orelse 1.0e-12;
+        const i_leak = parseMeasureWithFallback(output, "MEAS_LEAK=", 1.0e-12);
         return i_leak * self.config.nom_voltage * 1.0e9; // V * A -> W -> nW
     }
 
@@ -193,30 +240,30 @@ pub const SimContext = struct {
 
     /// Characterize all pins: pg_pins for power, signal pins with NLDM timing.
     pub fn characterizePins(self: *SimContext, allocator: std.mem.Allocator) !CharacterizationResult {
-        var pin_list = std.ArrayList(LibertyPin).init(allocator);
-        errdefer pin_list.deinit();
-        var pg_list = std.ArrayList(PgPin).init(allocator);
-        errdefer pg_list.deinit();
+        var pin_list: std.ArrayList(LibertyPin) = .empty;
+        errdefer pin_list.deinit(allocator);
+        var pg_list: std.ArrayList(PgPin) = .empty;
+        errdefer pg_list.deinit(allocator);
 
-        var inputs = std.ArrayList([]const u8).init(self.allocator);
-        defer inputs.deinit();
-        var outputs = std.ArrayList([]const u8).init(self.allocator);
-        defer outputs.deinit();
+        var inputs: std.ArrayList([]const u8) = .empty;
+        defer inputs.deinit(self.allocator);
+        var outputs: std.ArrayList([]const u8) = .empty;
+        defer outputs.deinit(self.allocator);
 
         var pwr_pin_name: ?[]const u8 = null;
         var gnd_pin_name: ?[]const u8 = null;
 
         for (self.ports) |port| {
             switch (port.role) {
-                .signal_in => try inputs.append(port.name),
-                .signal_out => try outputs.append(port.name),
+                .signal_in => try inputs.append(self.allocator, port.name),
+                .signal_out => try outputs.append(self.allocator, port.name),
                 .signal_inout => {
-                    try inputs.append(port.name);
-                    try outputs.append(port.name);
+                    try inputs.append(self.allocator, port.name);
+                    try outputs.append(self.allocator, port.name);
                 },
                 .vdd => {
                     if (pwr_pin_name == null) pwr_pin_name = port.name;
-                    try pg_list.append(.{
+                    try pg_list.append(allocator, .{
                         .name = port.name,
                         .pg_type = .primary_power,
                         .voltage_name = self.config.vdd_net,
@@ -224,18 +271,18 @@ pub const SimContext = struct {
                 },
                 .vss => {
                     if (gnd_pin_name == null) gnd_pin_name = port.name;
-                    try pg_list.append(.{
+                    try pg_list.append(allocator, .{
                         .name = port.name,
                         .pg_type = .primary_ground,
                         .voltage_name = self.config.vss_net,
                     });
                 },
-                .nwell => try pg_list.append(.{
+                .nwell => try pg_list.append(allocator, .{
                     .name = port.name,
                     .pg_type = .nwell,
                     .voltage_name = self.config.vdd_net,
                 }),
-                .pwell => try pg_list.append(.{
+                .pwell => try pg_list.append(allocator, .{
                     .name = port.name,
                     .pg_type = .pwell,
                     .voltage_name = self.config.vss_net,
@@ -246,7 +293,7 @@ pub const SimContext = struct {
         // Input pins with capacitance
         for (inputs.items) |inp| {
             const cap = try self.measureInputCap(inp);
-            try pin_list.append(.{
+            try pin_list.append(allocator, .{
                 .name = inp,
                 .direction = .input,
                 .capacitance = cap,
@@ -258,33 +305,33 @@ pub const SimContext = struct {
 
         // Output pins with NLDM timing arcs from each input
         for (outputs.items) |outp| {
-            var arcs = std.ArrayList(TimingArc).init(allocator);
-            errdefer arcs.deinit();
-            var powers = std.ArrayList(InternalPower).init(allocator);
-            errdefer powers.deinit();
+            var arcs: std.ArrayList(TimingArc) = .empty;
+            errdefer arcs.deinit(allocator);
+            var powers: std.ArrayList(InternalPower) = .empty;
+            errdefer powers.deinit(allocator);
 
             for (inputs.items) |inp| {
                 var result = try self.measureTimingArc(allocator, inp, outp);
                 result.arc.related_power_pin = pwr_pin_name;
                 result.arc.related_ground_pin = gnd_pin_name;
                 result.power.related_pg_pin = pwr_pin_name;
-                try arcs.append(result.arc);
-                try powers.append(result.power);
+                try arcs.append(allocator, result.arc);
+                try powers.append(allocator, result.power);
             }
 
-            try pin_list.append(.{
+            try pin_list.append(allocator, .{
                 .name = outp,
                 .direction = .output,
                 .capacitance = 0.0,
                 .max_capacitance = self.config.load_indices[self.config.load_indices.len - 1],
-                .timing_arcs = try arcs.toOwnedSlice(),
-                .internal_power = try powers.toOwnedSlice(),
+                .timing_arcs = try arcs.toOwnedSlice(allocator),
+                .internal_power = try powers.toOwnedSlice(allocator),
             });
         }
 
         return .{
-            .pins = try pin_list.toOwnedSlice(),
-            .pg_pins = try pg_list.toOwnedSlice(),
+            .pins = try pin_list.toOwnedSlice(allocator),
+            .pg_pins = try pg_list.toOwnedSlice(allocator),
         };
     }
 
@@ -312,9 +359,9 @@ pub const SimContext = struct {
         slew_ns: f64,
         load_pf: f64,
     ) !PointResult {
-        var deck = std.ArrayList(u8).init(self.allocator);
-        defer deck.deinit();
-        const w = deck.writer();
+        var deck: std.ArrayList(u8) = .empty;
+        defer deck.deinit(self.allocator);
+        const w = deck.writer(self.allocator);
 
         try self.writeDeckHeader(w);
 
@@ -377,12 +424,12 @@ pub const SimContext = struct {
         const output = try self.runNgspice(deck.items);
         defer self.allocator.free(output);
 
-        const tpd_rise_ns = @abs(parseNamedValue(output, "MEAS_TPD_RISE=") orelse 1.0e-9) * 1.0e9;
-        const tpd_fall_ns = @abs(parseNamedValue(output, "MEAS_TPD_FALL=") orelse 1.0e-9) * 1.0e9;
-        const t_rise_ns = @abs(parseNamedValue(output, "MEAS_T_RISE=") orelse 1.0e-10) * 1.0e9;
-        const t_fall_ns = @abs(parseNamedValue(output, "MEAS_T_FALL=") orelse 1.0e-10) * 1.0e9;
-        const iavg_rise = @abs(parseNamedValue(output, "MEAS_IAVG_RISE=") orelse 1.0e-6);
-        const iavg_fall = @abs(parseNamedValue(output, "MEAS_IAVG_FALL=") orelse 1.0e-6);
+        const tpd_rise_ns = @abs(parseMeasureWithFallback(output, "MEAS_TPD_RISE=", 1.0e-9)) * 1.0e9;
+        const tpd_fall_ns = @abs(parseMeasureWithFallback(output, "MEAS_TPD_FALL=", 1.0e-9)) * 1.0e9;
+        const t_rise_ns = @abs(parseMeasureWithFallback(output, "MEAS_T_RISE=", 1.0e-10)) * 1.0e9;
+        const t_fall_ns = @abs(parseMeasureWithFallback(output, "MEAS_T_FALL=", 1.0e-10)) * 1.0e9;
+        const iavg_rise = @abs(parseMeasureWithFallback(output, "MEAS_IAVG_RISE=", 1.0e-6));
+        const iavg_fall = @abs(parseMeasureWithFallback(output, "MEAS_IAVG_FALL=", 1.0e-6));
 
         const dt_ns = slew_ns * 2.0;
         return .{
@@ -400,9 +447,16 @@ pub const SimContext = struct {
         const slew_count = self.config.slew_indices.len;
         const load_count = self.config.load_indices.len;
 
+        // Infer timing sense from the netlist text (heuristic).
+        const inferred_sense = writer_mod.inferTimingSense(
+            self.spice_content,
+            input_pin,
+            output_pin,
+        );
+
         var arc = TimingArc{
             .related_pin = input_pin,
-            .timing_sense = .non_unate, // conservative default for analog
+            .timing_sense = inferred_sense,
             .timing_type = .combinational,
             .cell_rise = try NldmTable.init(allocator, slew_count, load_count),
             .cell_fall = try NldmTable.init(allocator, slew_count, load_count),
@@ -443,9 +497,9 @@ pub const SimContext = struct {
 
     fn measureInputCap(self: *SimContext, pin_name: []const u8) !f64 {
         // Use AC analysis: apply AC source, measure input impedance at low freq
-        var deck = std.ArrayList(u8).init(self.allocator);
-        defer deck.deinit();
-        const w = deck.writer();
+        var deck: std.ArrayList(u8) = .empty;
+        defer deck.deinit(self.allocator);
+        const w = deck.writer(self.allocator);
 
         try self.writeDeckHeader(w);
 
@@ -479,7 +533,7 @@ pub const SimContext = struct {
         const output = try self.runNgspice(deck.items);
         defer self.allocator.free(output);
 
-        const cin_f = parseNamedValue(output, "MEAS_CIN=") orelse 5.0e-15; // 5fF fallback
+        const cin_f = parseMeasureWithFallback(output, "MEAS_CIN=", 5.0e-15); // 5fF fallback
         return @abs(cin_f) * 1.0e12; // F -> pF
     }
 

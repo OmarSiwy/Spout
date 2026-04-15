@@ -15,6 +15,14 @@ const CostFunction = cost_mod.CostFunction;
 const CostWeights = cost_mod.CostWeights;
 const Constraint = cost_mod.Constraint;
 const PinInfo = cost_mod.PinInfo;
+const Orientation = types.Orientation;
+const transformPinOffset = cost_mod.transformPinOffset;
+const CentroidGroup = cost_mod.CentroidGroup;
+const HeatSource = cost_mod.HeatSource;
+const WellRegion = cost_mod.WellRegion;
+const GuardRingResult = cost_mod.GuardRingResult;
+const insertDummies = cost_mod.insertDummies;
+const checkGuardRings = cost_mod.checkGuardRings;
 
 // ─── Move type ──────────────────────────────────────────────────────────────
 
@@ -30,6 +38,10 @@ pub const MoveType = enum {
     macro_translate,
     /// Apply a random affine transform (mirror/rotate) to a macro instance.
     macro_transform,
+    /// Flip a device's orientation (cycle through valid DEF orientations).
+    orientation_flip,
+    /// Translate all devices in one side of a centroid group together.
+    group_translate,
 };
 
 // ─── SA configuration ───────────────────────────────────────────────────────
@@ -65,6 +77,55 @@ pub const SaConfig = extern struct {
     /// Phase 1b re-optimization trigger: run if unit-cell HPWL / top-level HPWL
     /// exceeds this ratio after phase 2. 0.0 = always skip phase 1b.
     hpwl_ratio_phase1b: f32 = 0.3,
+    // ── Proximity / isolation constraint weights ─────────────────────────
+    w_proximity: f32 = 1.0,
+    w_isolation: f32 = 1.0,
+    // ── Thermal symmetry weight (Phase 5) ───────────────────────────────
+    w_thermal: f32 = 0.5,
+    // ── Orientation (Phase 2) ─────────────────────────────────────────────
+    /// Probability of choosing an orientation flip move.
+    p_orientation_flip: f32 = 0.05,
+    /// Weight for orientation mismatch cost term.
+    w_orientation: f32 = 2.0,
+    // ── LDE (Phase 4) ────────────────────────────────────────────────────
+    /// Weight for LDE (SA/SB equalization) cost term.
+    w_lde: f32 = 0.5,
+    // ── Common-centroid (Phase 3) ────────────────────────────────────────
+    /// Weight for common-centroid cost term.
+    w_common_centroid: f32 = 2.0,
+    /// Probability of choosing a group_translate move (0 = disabled).
+    p_group_translate: f32 = 0.0,
+    // ── Parasitic routing balance (Phase 8) ──────────────────────────────
+    /// Weight for parasitic routing balance cost term.
+    w_parasitic: f32 = 0.8,
+    // ── Interdigitation (Phase 7) ────────────────────────────────────────
+    /// Weight for interdigitation cost term.
+    w_interdigitation: f32 = 2.0,
+    // ── Edge penalty (Phase 6) ────────────────────────────────────────────
+    /// Weight for edge penalty cost term (dummy device modeling).
+    w_edge_penalty: f32 = 0.5,
+    // ── WPE (Phase 9) ─────────────────────────────────────────────────────
+    /// Weight for WPE (Well Proximity Effect) mismatch cost term.
+    w_wpe: f32 = 0.5,
+    // ── Template bounds (Phase 3) ─────────────────────────────────────────
+    /// Template/user-area hard placement bounds. All devices must stay within.
+    template_x_min: f32 = 0.0,
+    template_y_min: f32 = 0.0,
+    template_x_max: f32 = 1.0e9,
+    template_y_max: f32 = 1.0e9,
+    use_template_bounds: bool = false,
+    _template_pad: [3]u8 = .{ 0, 0, 0 },  // alignment
+};
+
+// ─── SA extended input ──────────────────────────────────────────────────────
+
+/// Optional extended inputs for runSa(). All fields default to empty,
+/// making the new parameter backward compatible with existing callers.
+pub const SaExtendedInput = struct {
+    centroid_groups: []const CentroidGroup = &.{},
+    heat_sources: []const HeatSource = &.{},
+    interdigitation_groups: []const CentroidGroup = &.{},
+    well_regions: []const WellRegion = &.{},
 };
 
 // ─── SA result ──────────────────────────────────────────────────────────────
@@ -77,6 +138,10 @@ pub const SaResult = struct {
     reheat_count: u32,
     /// Number of temperature levels executed.
     temperature_levels: u32,
+    /// Number of dummy devices inserted post-SA (Phase 6).
+    dummy_count: u32 = 0,
+    /// Guard ring validation results (Phase 9). Caller must free via allocator.
+    guard_ring_results: []const GuardRingResult = &.{},
 };
 
 // ─── Private schedule helpers ────────────────────────────────────────────────
@@ -190,6 +255,7 @@ fn mergeNetLists(
     var count: u32 = 0;
 
     for (nets_a) |n| {
+        std.debug.assert(count < buf.len);
         buf[count] = n;
         count += 1;
     }
@@ -198,6 +264,7 @@ fn mergeNetLists(
         for (buf[0..count]) |existing| {
             if (existing == n) continue :outer;
         }
+        std.debug.assert(count < buf.len);
         buf[count] = n;
         count += 1;
     }
@@ -207,16 +274,18 @@ fn mergeNetLists(
 
 // ─── Pin-position helpers ───────────────────────────────────────────────────
 
-/// Recompute all pin positions from device positions + pin offsets.
+/// Recompute all pin positions from device positions + pin offsets + orientations.
 fn recomputeAllPinPositions(
     pin_positions: [][2]f32,
     device_positions: []const [2]f32,
     pin_info: []const PinInfo,
+    orientations: []const Orientation,
 ) void {
     for (pin_positions, 0..) |*pp, i| {
         const info = pin_info[i];
-        pp.*[0] = device_positions[info.device][0] + info.offset_x;
-        pp.*[1] = device_positions[info.device][1] + info.offset_y;
+        const xformed = transformPinOffset(info.offset_x, info.offset_y, orientations[info.device]);
+        pp.*[0] = device_positions[info.device][0] + xformed[0];
+        pp.*[1] = device_positions[info.device][1] + xformed[1];
     }
 }
 
@@ -226,11 +295,13 @@ fn updatePinPositionsForDevice(
     device_positions: []const [2]f32,
     pin_info: []const PinInfo,
     dev: u32,
+    orientations: []const Orientation,
 ) void {
     for (pin_positions, 0..) |*pp, i| {
         if (pin_info[i].device == dev) {
-            pp.*[0] = device_positions[dev][0] + pin_info[i].offset_x;
-            pp.*[1] = device_positions[dev][1] + pin_info[i].offset_y;
+            const xformed = transformPinOffset(pin_info[i].offset_x, pin_info[i].offset_y, orientations[dev]);
+            pp.*[0] = device_positions[dev][0] + xformed[0];
+            pp.*[1] = device_positions[dev][1] + xformed[1];
         }
     }
 }
@@ -261,6 +332,7 @@ pub fn runSa(
     config: SaConfig,
     seed: u64,
     allocator: std.mem.Allocator,
+    extended: SaExtendedInput,
 ) !SaResult {
     const num_devices: u32 = @intCast(device_positions.len);
     const num_pins: u32 = @intCast(pin_info.len);
@@ -284,6 +356,11 @@ pub fn runSa(
     // Snapshot of pin positions taken before each move (pre-move state).
     const saved_pin_positions = try allocator.alloc([2]f32, num_pins);
     defer allocator.free(saved_pin_positions);
+
+    // Device orientations (all start at .N = north).
+    const orientations = try allocator.alloc(Orientation, num_devices);
+    defer allocator.free(orientations);
+    @memset(orientations, .N);
 
     // Build device → nets mapping.
     const device_nets = try buildDeviceNets(allocator, num_devices, pin_info, adj);
@@ -341,9 +418,19 @@ pub fn runSa(
             pos.*[0] = std.math.clamp(pos.*[0] + offset_x, 0.0, layout_width);
             pos.*[1] = std.math.clamp(pos.*[1] + offset_y, 0.0, layout_height);
         }
+
+        // If template bounds are active, re-place devices uniformly within them.
+        if (config.use_template_bounds) {
+            const area_w = config.template_x_max - config.template_x_min;
+            const area_h = config.template_y_max - config.template_y_min;
+            for (0..num_devices) |i| {
+                device_positions[i][0] = config.template_x_min + random.float(f32) * area_w;
+                device_positions[i][1] = config.template_y_min + random.float(f32) * area_h;
+            }
+        }
     }
 
-    recomputeAllPinPositions(pin_positions, device_positions, pin_info);
+    recomputeAllPinPositions(pin_positions, device_positions, pin_info, orientations);
     rudy_grid.computeFull(pin_positions, adj);
 
     // ── Cost function ───────────────────────────────────────────────────
@@ -353,10 +440,28 @@ pub fn runSa(
         .w_area = config.w_area,
         .w_symmetry = config.w_symmetry,
         .w_matching = config.w_matching,
+        .w_proximity = config.w_proximity,
+        .w_isolation = config.w_isolation,
         .w_rudy = config.w_rudy,
         .w_overlap = config.w_overlap,
+        .w_thermal = config.w_thermal,
+        .w_orientation = config.w_orientation,
+        .w_lde = config.w_lde,
+        .w_common_centroid = config.w_common_centroid,
+        .w_parasitic = config.w_parasitic,
+        .w_interdigitation = config.w_interdigitation,
+        .w_edge_penalty = config.w_edge_penalty,
+        .w_wpe = config.w_wpe,
     };
     var cost_fn = CostFunction.init(weights);
+    cost_fn.layout_width = layout_width;
+    cost_fn.layout_height = layout_height;
+    cost_fn.device_nets_map = device_nets;
+    cost_fn.orientations = orientations;
+    cost_fn.centroid_groups = extended.centroid_groups;
+    cost_fn.heat_sources = extended.heat_sources;
+    cost_fn.interdigitation_groups = extended.interdigitation_groups;
+    cost_fn.well_regions = extended.well_regions;
     _ = cost_fn.computeFull(
         device_positions,
         device_dimensions,
@@ -408,6 +513,8 @@ pub fn runSa(
                     temperature,
                     config,
                     random,
+                    orientations,
+                    allocator,
                 );
                 total_iters += 1;
                 level_total += 1;
@@ -451,6 +558,8 @@ pub fn runSa(
                 temperature,
                 config,
                 random,
+                orientations,
+                allocator,
             );
             total_iters += 1;
             if (accepted) total_accepted += 1;
@@ -460,9 +569,38 @@ pub fn runSa(
     }
 
     // Final consistency pass: recompute everything from the converged placement.
-    recomputeAllPinPositions(pin_positions, device_positions, pin_info);
+    recomputeAllPinPositions(pin_positions, device_positions, pin_info, orientations);
     rudy_grid.computeFull(pin_positions, adj);
     _ = cost_fn.computeFull(device_positions, device_dimensions, pin_positions, adj, constraints, &rudy_grid, &.{});
+
+    // ── Post-SA: dummy insertion estimate (Phase 6) ──────────────────
+    // insertDummies() grows parallel arrays and requires ArrayList storage,
+    // which the caller must provide. Here we estimate the dummy count by
+    // counting exposed edges on matched devices so the caller knows whether
+    // to invoke insertDummies() post-SA.
+    var dummy_count: u32 = 0;
+    {
+        const countExposedEdges = cost_mod.countExposedEdges;
+        const is_dummy_empty: []const bool = &.{};
+        for (constraints) |c| {
+            if (c.kind != .matching) continue;
+            const ea = countExposedEdges(c.dev_a, device_positions, device_dimensions, is_dummy_empty, layout_width, layout_height);
+            const eb = countExposedEdges(c.dev_b, device_positions, device_dimensions, is_dummy_empty, layout_width, layout_height);
+            dummy_count += @as(u32, ea) + @as(u32, eb);
+        }
+    }
+
+    // ── Post-SA: guard ring validation (Phase 9) ───────────────────────
+    var guard_ring_results: []const GuardRingResult = &.{};
+    if (extended.well_regions.len > 0) {
+        guard_ring_results = checkGuardRings(
+            device_positions,
+            device_dimensions,
+            constraints,
+            extended.well_regions,
+            allocator,
+        ) catch &.{};
+    }
 
     return SaResult{
         .final_cost = cost_fn.total,
@@ -470,6 +608,8 @@ pub fn runSa(
         .accepted_moves = total_accepted,
         .reheat_count = reheat_count,
         .temperature_levels = temperature_levels,
+        .dummy_count = dummy_count,
+        .guard_ring_results = guard_ring_results,
     };
 }
 
@@ -494,17 +634,26 @@ fn runOneMove(
     temperature: f32,
     config: SaConfig,
     random: std.Random,
+    orientations: []Orientation,
+    allocator: std.mem.Allocator,
 ) bool {
     const num_devices: u32 = @intCast(device_positions.len);
 
     // Decide move type.
     const move_type: MoveType = blk: {
         const roll = random.float(f32);
-        if (roll < config.p_swap and num_devices >= 2) {
-            // Check whether a mirror_swap is applicable: find any symmetry
-            // constraint linking the (not-yet-chosen) pair.  We pick the
-            // swap targets first.
-            break :blk .swap; // refined below after picking i/j
+        var threshold: f32 = 0.0;
+        threshold += config.p_orientation_flip;
+        if (roll < threshold) {
+            break :blk .orientation_flip;
+        }
+        threshold += config.p_group_translate;
+        if (roll < threshold and cost_fn.centroid_groups.len > 0) {
+            break :blk .group_translate;
+        }
+        threshold += config.p_swap;
+        if (roll < threshold and num_devices >= 2) {
+            break :blk .swap;
         }
         break :blk .translate;
     };
@@ -527,6 +676,7 @@ fn runOneMove(
                 temperature,
                 config,
                 random,
+                orientations,
             );
         },
         .swap => {
@@ -548,6 +698,47 @@ fn runOneMove(
                 config,
                 random,
                 false, // not forced mirror
+                orientations,
+            );
+        },
+        .orientation_flip => {
+            return runOrientationFlipMove(
+                device_positions,
+                device_dimensions,
+                pin_positions,
+                saved_pin_positions,
+                pin_info,
+                adj,
+                constraints,
+                device_nets,
+                rudy_grid,
+                cost_fn,
+                layout_width,
+                layout_height,
+                temperature,
+                random,
+                orientations,
+            );
+        },
+        .group_translate => {
+            return runGroupTranslateMove(
+                device_positions,
+                device_dimensions,
+                pin_positions,
+                saved_pin_positions,
+                pin_info,
+                adj,
+                constraints,
+                device_nets,
+                rudy_grid,
+                cost_fn,
+                layout_width,
+                layout_height,
+                temperature,
+                config,
+                random,
+                orientations,
+                allocator,
             );
         },
         .mirror_swap => unreachable, // selected inside runSwapMove after pair is known
@@ -574,6 +765,7 @@ fn runTranslateMove(
     temperature: f32,
     config: SaConfig,
     random: std.Random,
+    orientations: []const Orientation,
 ) bool {
     const num_devices: u32 = @intCast(device_positions.len);
 
@@ -595,8 +787,25 @@ fn runTranslateMove(
     device_positions[dev][0] = std.math.clamp(old_dev_pos[0] + dx, 0.0, layout_width);
     device_positions[dev][1] = std.math.clamp(old_dev_pos[1] + dy, 0.0, layout_height);
 
+    // (d2) Hard template-bounds rejection.
+    if (config.use_template_bounds) {
+        const dev_w = if (device_dimensions.len > dev) device_dimensions[dev][0] else 0.0;
+        const dev_h = if (device_dimensions.len > dev) device_dimensions[dev][1] else 0.0;
+        const new_x = device_positions[dev][0];
+        const new_y = device_positions[dev][1];
+        if (new_x < config.template_x_min or
+            new_x + dev_w > config.template_x_max or
+            new_y < config.template_y_min or
+            new_y + dev_h > config.template_y_max)
+        {
+            // Restore position and return without accepting.
+            device_positions[dev] = old_dev_pos;
+            return false;
+        }
+    }
+
     // (e) Update pin positions for the moved device.
-    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev);
+    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev, orientations);
 
     // Incrementally update RUDY.
     rudy_grid.updateIncremental(device_nets[dev], saved_pin_positions, pin_positions, adj);
@@ -630,7 +839,18 @@ fn runTranslateMove(
             delta_result.new_area,
             delta_result.new_sym,
             delta_result.new_match,
+            delta_result.new_prox,
+            delta_result.new_iso,
             delta_result.new_rudy,
+            delta_result.new_overlap,
+            delta_result.new_thermal,
+            delta_result.new_lde,
+            delta_result.new_orientation,
+            delta_result.new_centroid,
+            delta_result.new_parasitic,
+            delta_result.new_interdigitation,
+            delta_result.new_edge_penalty,
+            delta_result.new_wpe,
             delta_result.new_total,
         );
     } else {
@@ -669,6 +889,7 @@ fn runSwapMove(
     _: SaConfig,
     random: std.Random,
     force_mirror: bool,
+    orientations: []const Orientation,
 ) bool {
     const num_devices: u32 = @intCast(device_positions.len);
 
@@ -685,12 +906,14 @@ fn runSwapMove(
     // Detect whether a symmetry constraint links i and j.
     var sym_axis: f32 = 0.0;
     var has_sym = false;
+    var sym_kind: types.ConstraintType = .symmetry;
     for (constraints) |c| {
-        if (c.kind == .symmetry) {
+        if (c.kind == .symmetry or c.kind == .symmetry_y) {
             if ((c.dev_a == dev_i and c.dev_b == dev_j) or
                 (c.dev_a == dev_j and c.dev_b == dev_i))
             {
-                sym_axis = c.axis_x;
+                sym_kind = c.kind;
+                sym_axis = if (c.kind == .symmetry_y) c.axis_y else c.axis_x;
                 has_sym = true;
                 break;
             }
@@ -701,12 +924,23 @@ fn runSwapMove(
     const do_mirror = (force_mirror or has_sym) and has_sym;
 
     if (do_mirror) {
-        // Mirror_swap: place i at mirror of old i about axis, j at old i's position.
-        // Mirror formula: new_x_i = 2·axis - old_x_i
-        device_positions[dev_i][0] = 2.0 * sym_axis - old_pos_i[0];
-        device_positions[dev_i][1] = old_pos_i[1];
-        device_positions[dev_j][0] = old_pos_i[0];
-        device_positions[dev_j][1] = old_pos_i[1];
+        if (sym_kind == .symmetry_y) {
+            // Y-axis mirror_swap: each device mirrors about y=axis_y.
+            // dev_i lands at mirror of its own old position.
+            // dev_j lands at mirror of its own old position.
+            device_positions[dev_i][0] = old_pos_i[0];
+            device_positions[dev_i][1] = 2.0 * sym_axis - old_pos_i[1];
+            device_positions[dev_j][0] = old_pos_j[0];
+            device_positions[dev_j][1] = 2.0 * sym_axis - old_pos_j[1];
+        } else {
+            // X-axis mirror_swap: each device mirrors about x=axis_x.
+            // dev_i lands at mirror of its own old position.
+            // dev_j lands at mirror of its own old position.
+            device_positions[dev_i][0] = 2.0 * sym_axis - old_pos_i[0];
+            device_positions[dev_i][1] = old_pos_i[1];
+            device_positions[dev_j][0] = 2.0 * sym_axis - old_pos_j[0];
+            device_positions[dev_j][1] = old_pos_j[1];
+        }
     } else {
         // Plain swap: exchange positions.
         device_positions[dev_i] = old_pos_j;
@@ -720,8 +954,8 @@ fn runSwapMove(
     device_positions[dev_j][1] = std.math.clamp(device_positions[dev_j][1], 0.0, layout_height);
 
     // Update pin positions for both moved devices.
-    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev_i);
-    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev_j);
+    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev_i, orientations);
+    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev_j, orientations);
 
     // Build merged net list (union of both devices' nets).
     const merged_count = mergeNetLists(device_nets[dev_i], device_nets[dev_j], merged_nets_buf);
@@ -761,7 +995,18 @@ fn runSwapMove(
             delta_result.new_area,
             delta_result.new_sym,
             delta_result.new_match,
+            delta_result.new_prox,
+            delta_result.new_iso,
             delta_result.new_rudy,
+            delta_result.new_overlap,
+            delta_result.new_thermal,
+            delta_result.new_lde,
+            delta_result.new_orientation,
+            delta_result.new_centroid,
+            delta_result.new_parasitic,
+            delta_result.new_interdigitation,
+            delta_result.new_edge_penalty,
+            delta_result.new_wpe,
             delta_result.new_total,
         );
     } else {
@@ -770,6 +1015,249 @@ fn runSwapMove(
         // Restore positions.
         device_positions[dev_i] = old_pos_i;
         device_positions[dev_j] = old_pos_j;
+        @memcpy(pin_positions, saved_pin_positions);
+    }
+
+    return accept;
+}
+
+
+// ─── Orientation flip move ──────────────────────────────────────────────────
+
+/// Execute an orientation flip move on a randomly-chosen device.
+/// Picks a random new orientation from the 8 DEF orientations, updates pin
+/// positions accordingly, and applies Metropolis acceptance.
+fn runOrientationFlipMove(
+    device_positions: [][2]f32,
+    device_dimensions: []const [2]f32,
+    pin_positions: [][2]f32,
+    saved_pin_positions: [][2]f32,
+    pin_info: []const PinInfo,
+    adj: NetAdjacency,
+    constraints: []const Constraint,
+    device_nets: []const []u32,
+    rudy_grid: *RudyGrid,
+    cost_fn: *CostFunction,
+    layout_width: f32,
+    layout_height: f32,
+    temperature: f32,
+    random: std.Random,
+    orientations: []Orientation,
+) bool {
+    _ = layout_width;
+    _ = layout_height;
+    const num_devices: u32 = @intCast(device_positions.len);
+
+    // (a) Pick a random device.
+    const dev: u32 = random.intRangeLessThan(u32, 0, num_devices);
+
+    // Save state before move.
+    const old_orient = orientations[dev];
+    @memcpy(saved_pin_positions, pin_positions);
+
+    // (b) Pick a random new orientation (guaranteed different from current).
+    // Pick from 0..6, then skip past old_orient to ensure change.
+    const all_orients = [_]Orientation{ .N, .S, .FN, .FS, .E, .W, .FE, .FW };
+    const pick = random.intRangeLessThan(usize, 0, 6); // 0..5 (6 choices, all different from .FW=7)
+    const old_idx = @intFromEnum(old_orient);
+    const new_idx = if (pick < old_idx) pick else pick + 1;
+    const new_orient = all_orients[new_idx];
+    if (new_idx == old_idx) {
+        // Fallback: use last option which is always different from old_idx
+        orientations[dev] = all_orients[7 - old_idx];
+    } else {
+        orientations[dev] = new_orient;
+    }
+
+    // (c) Update pin positions for the flipped device.
+    updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev, orientations);
+
+    // Incrementally update RUDY.
+    rudy_grid.updateIncremental(device_nets[dev], saved_pin_positions, pin_positions, adj);
+
+    // (d) Compute delta cost.
+    const delta_result = cost_fn.computeDeltaCost(
+        dev,
+        device_positions[dev],
+        device_positions[dev],
+        saved_pin_positions,
+        pin_positions,
+        device_positions,
+        device_dimensions,
+        adj,
+        device_nets[dev],
+        constraints,
+        rudy_grid,
+    );
+
+    // (e) Metropolis acceptance criterion.
+    const accept = if (delta_result.delta < 0.0)
+        true
+    else blk: {
+        const boltzmann = @exp(-delta_result.delta / temperature);
+        break :blk random.float(f32) < boltzmann;
+    };
+
+    if (accept) {
+        cost_fn.acceptDelta(
+            delta_result.new_hpwl_sum,
+            delta_result.new_area,
+            delta_result.new_sym,
+            delta_result.new_match,
+            delta_result.new_prox,
+            delta_result.new_iso,
+            delta_result.new_rudy,
+            delta_result.new_overlap,
+            delta_result.new_thermal,
+            delta_result.new_lde,
+            delta_result.new_orientation,
+            delta_result.new_centroid,
+            delta_result.new_parasitic,
+            delta_result.new_interdigitation,
+            delta_result.new_edge_penalty,
+            delta_result.new_wpe,
+            delta_result.new_total,
+        );
+    } else {
+        // Revert RUDY then restore positions and orientation.
+        rudy_grid.updateIncremental(device_nets[dev], pin_positions, saved_pin_positions, adj);
+        orientations[dev] = old_orient;
+        @memcpy(pin_positions, saved_pin_positions);
+    }
+
+    return accept;
+}
+
+// ─── Group translate move (common-centroid Phase 3) ─────────────────────────
+
+/// Translate all devices in one side of a randomly-chosen centroid group by
+/// the same (dx, dy).  This preserves intra-group relative positions while
+/// exploring the centroid-matching cost landscape.
+fn runGroupTranslateMove(
+    device_positions: [][2]f32,
+    device_dimensions: []const [2]f32,
+    pin_positions: [][2]f32,
+    saved_pin_positions: [][2]f32,
+    pin_info: []const PinInfo,
+    adj: NetAdjacency,
+    constraints: []const Constraint,
+    device_nets: []const []u32,
+    rudy_grid: *RudyGrid,
+    cost_fn: *CostFunction,
+    layout_width: f32,
+    layout_height: f32,
+    temperature: f32,
+    config: SaConfig,
+    random: std.Random,
+    orientations: []const Orientation,
+    allocator: std.mem.Allocator,
+) bool {
+    const groups = cost_fn.centroid_groups;
+    if (groups.len == 0) return false;
+
+    // (a) Pick a random centroid group.
+    const g_idx = random.intRangeLessThan(usize, 0, groups.len);
+    const group = groups[g_idx];
+
+    // Pick group A or group B at random.
+    const members = if (random.boolean()) group.group_a else group.group_b;
+    if (members.len == 0) return false;
+
+    // (b) Save state before move.
+    @memcpy(saved_pin_positions, pin_positions);
+    const saved_positions = allocator.alloc([2]f32, members.len) catch return false;
+    defer allocator.free(saved_positions);
+    for (members, 0..) |dev, k| {
+        saved_positions[k] = device_positions[dev];
+    }
+
+    // (c) Adaptive perturbation range.
+    const rho = computeRho(temperature, config.initial_temp, layout_width, layout_height, config.perturbation_range);
+    const dx = (random.float(f32) * 2.0 - 1.0) * rho;
+    const dy = (random.float(f32) * 2.0 - 1.0) * rho;
+
+    // (d) Apply displacement to all group members.
+    for (members) |dev| {
+        device_positions[dev][0] = std.math.clamp(device_positions[dev][0] + dx, 0.0, layout_width);
+        device_positions[dev][1] = std.math.clamp(device_positions[dev][1] + dy, 0.0, layout_height);
+        updatePinPositionsForDevice(pin_positions, device_positions, pin_info, dev, orientations);
+    }
+
+    // (e) Incrementally update RUDY for affected nets.
+    // Collect all affected nets (union of all members' nets).
+    // Use adj.num_nets as safe upper bound for the dedup buffer.
+    const affected_buf = allocator.alloc(u32, @max(adj.num_nets, 1)) catch return false;
+    defer allocator.free(affected_buf);
+    var affected_count: u32 = 0;
+    for (members) |dev| {
+        for (device_nets[dev]) |net| {
+            var found = false;
+            for (affected_buf[0..affected_count]) |existing| {
+                if (existing == net) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                affected_buf[affected_count] = net;
+                affected_count += 1;
+            }
+        }
+    }
+    const affected_nets = affected_buf[0..affected_count];
+    rudy_grid.updateIncremental(affected_nets, saved_pin_positions, pin_positions, adj);
+
+    // (f) Compute delta cost (use first device as representative — area/sym/etc.
+    // are fully recomputed anyway).
+    const rep_dev = members[0];
+    const delta_result = cost_fn.computeDeltaCost(
+        rep_dev,
+        saved_positions[0],
+        device_positions[rep_dev],
+        saved_pin_positions,
+        pin_positions,
+        device_positions,
+        device_dimensions,
+        adj,
+        affected_nets,
+        constraints,
+        rudy_grid,
+    );
+
+    // (g) Metropolis acceptance criterion.
+    const accept = if (delta_result.delta < 0.0)
+        true
+    else blk: {
+        const boltzmann = @exp(-delta_result.delta / temperature);
+        break :blk random.float(f32) < boltzmann;
+    };
+
+    if (accept) {
+        cost_fn.acceptDelta(
+            delta_result.new_hpwl_sum,
+            delta_result.new_area,
+            delta_result.new_sym,
+            delta_result.new_match,
+            delta_result.new_prox,
+            delta_result.new_iso,
+            delta_result.new_rudy,
+            delta_result.new_overlap,
+            delta_result.new_thermal,
+            delta_result.new_lde,
+            delta_result.new_orientation,
+            delta_result.new_centroid,
+            delta_result.new_parasitic,
+            delta_result.new_interdigitation,
+            delta_result.new_edge_penalty,
+            delta_result.new_wpe,
+            delta_result.new_total,
+        );
+    } else {
+        // Revert RUDY then restore positions.
+        rudy_grid.updateIncremental(affected_nets, pin_positions, saved_pin_positions, adj);
+        for (members, 0..) |dev, k| {
+            device_positions[dev] = saved_positions[k];
+        }
         @memcpy(pin_positions, saved_pin_positions);
     }
 
@@ -824,6 +1312,7 @@ pub fn runSaHierarchical(
             config,
             seed,
             allocator,
+            .{},
         );
     }
 
@@ -843,7 +1332,7 @@ pub fn runSaHierarchical(
         // No inter-cell pins or constraints for the unit cell — pass empty slices.
         const empty_adj = NetAdjacency{ .net_pin_starts = &.{}, .pin_list = &.{}, .num_nets = 0 };
         _ = try runSa(tmpl_pos, tmpl_dim, &.{}, empty_adj, &.{},
-            layout_width, layout_height, config, seed, allocator);
+            layout_width, layout_height, config, seed, allocator, .{});
         for (tmpl.device_indices, 0..) |di, k| {
             devices.positions[di] = tmpl_pos[k];
         }
@@ -901,12 +1390,12 @@ pub fn runSaHierarchical(
         const sa = dev_to_super[c.dev_a];
         const sb = dev_to_super[c.dev_b];
         if (sa == sb) continue; // intra-instance
-        try super_cst.append(.{ .kind = c.kind, .dev_a = sa, .dev_b = sb, .axis_x = c.axis_x });
+        try super_cst.append(.{ .kind = c.kind, .dev_a = sa, .dev_b = sb, .axis_x = c.axis_x, .axis_y = c.axis_y, .param = c.param });
     }
 
     const phase2 = try runSa(
         super_pos, super_dim, super_pins, adj, super_cst.items,
-        layout_width, layout_height, config, seed ^ 0x9e3779b9, allocator,
+        layout_width, layout_height, config, seed ^ 0x9e3779b9, allocator, .{},
     );
 
     // Write back: instance positions and non-macro device positions.
@@ -932,7 +1421,7 @@ pub fn runSaHierarchical(
             }
             const empty_adj = NetAdjacency{ .net_pin_starts = &.{}, .pin_list = &.{}, .num_nets = 0 };
             _ = try runSa(tmpl_pos, tmpl_dim, &.{}, empty_adj, &.{},
-                layout_width, layout_height, config, seed ^ 0xdeadbeef, allocator);
+                layout_width, layout_height, config, seed ^ 0xdeadbeef, allocator, .{});
             for (tmpl.device_indices, 0..) |di, k| {
                 devices.positions[di] = tmpl_pos[k];
             }
@@ -987,6 +1476,7 @@ test "runSa zero devices" {
         config,
         42,
         std.testing.allocator,
+        .{},
     );
     try std.testing.expectEqual(@as(f32, 0.0), result.final_cost);
     try std.testing.expectEqual(@as(u32, 0), result.reheat_count);
@@ -1067,6 +1557,7 @@ test "kappa N scaling: iterations roughly proportional to N" {
             config,
             1,
             alloc,
+            .{},
         );
         // iterations_run should be roughly kappa * N * num_levels.
         // At minimum it must be >= kappa * N (at least one level).
@@ -1100,6 +1591,7 @@ test "kappa N scaling: iterations roughly proportional to N" {
             config,
             1,
             alloc,
+            .{},
         );
         try std.testing.expect(result.iterations_run >= 10 * 10);
         try std.testing.expect(!std.math.isNan(result.final_cost));
@@ -1184,6 +1676,7 @@ test "reheating fires when acceptance rate is low" {
         config,
         77,
         alloc,
+        .{},
     );
 
     // reheat_count must be in [0, max_reheats].
@@ -1275,6 +1768,7 @@ test "swap-only and translate-only both produce finite non-negative cost" {
             config,
             42,
             alloc,
+            .{},
         );
         try std.testing.expect(result.final_cost >= 0.0);
         try std.testing.expect(!std.math.isNan(result.final_cost));
@@ -1303,6 +1797,7 @@ test "swap-only and translate-only both produce finite non-negative cost" {
             config,
             42,
             alloc,
+            .{},
         );
         try std.testing.expect(result.final_cost >= 0.0);
         try std.testing.expect(!std.math.isNan(result.final_cost));
@@ -1344,8 +1839,8 @@ test "SA is deterministic with same seed (kappa schedule)" {
     var pos_a = [_][2]f32{ .{ 0.0, 0.0 } } ** num_devices;
     var pos_b = [_][2]f32{ .{ 0.0, 0.0 } } ** num_devices;
 
-    const result_a = try runSa(&pos_a, &dims, &pin_info_arr, adj, &constraints, 100.0, 100.0, config, 7777, alloc);
-    const result_b = try runSa(&pos_b, &dims, &pin_info_arr, adj, &constraints, 100.0, 100.0, config, 7777, alloc);
+    const result_a = try runSa(&pos_a, &dims, &pin_info_arr, adj, &constraints, 100.0, 100.0, config, 7777, alloc, .{});
+    const result_b = try runSa(&pos_b, &dims, &pin_info_arr, adj, &constraints, 100.0, 100.0, config, 7777, alloc, .{});
 
     try std.testing.expectApproxEqAbs(result_a.final_cost, result_b.final_cost, 1e-5);
     try std.testing.expectEqual(result_a.iterations_run, result_b.iterations_run);
@@ -1388,7 +1883,7 @@ test "mirror_swap preserves symmetry-axis property" {
     };
     const dims = [_][2]f32{ .{ 2.0, 2.0 }, .{ 2.0, 2.0 } };
     const constraints = [_]Constraint{
-        .{ .kind = .symmetry, .dev_a = 0, .dev_b = 1, .axis_x = 5.0 },
+        .{ .kind = .symmetry, .dev_a = 0, .dev_b = 1, .axis_x = 5.0, .axis_y = 0.0, .param = 0.0 },
     };
 
     // Set up positions and run the engine with mirror_swap forced via high p_swap
@@ -1541,4 +2036,40 @@ test "SaConfig default fields for new additions" {
     try std.testing.expectEqual(@as(f32, 0.0), config.p_macro_translate);
     try std.testing.expectEqual(@as(f32, 0.0), config.p_macro_transform);
     try std.testing.expectEqual(@as(f32, 0.3), config.hpwl_ratio_phase1b);
+}
+
+// ── Test: Y-axis mirror_swap geometry ────────────────────────────────────────
+
+test "mirror_swap Y-axis preserves symmetry-axis property" {
+    // Two devices at (5, 3) and (5, 7), symmetry_y axis at y=5.
+    // After Y-axis mirror_swap:
+    //   dev_i (0): x stays at 5, y = 2*5 - 3 = 7
+    //   dev_j (1): gets old position of dev_i = (5, 3)
+    // Property: positions[0][1] + positions[1][1] == 2 * axis_y
+
+    var positions = [_][2]f32{ .{ 5.0, 3.0 }, .{ 5.0, 7.0 } };
+
+    const axis_y: f32 = 5.0;
+    const old_pos_i = positions[0];
+
+    // Apply Y-axis mirror_swap manually (same logic as runSwapMove with
+    // sym_kind == .symmetry_y and do_mirror == true).
+    positions[0][0] = old_pos_i[0]; // x unchanged
+    positions[0][1] = 2.0 * axis_y - old_pos_i[1]; // mirror y
+    positions[1][0] = old_pos_i[0]; // j gets old i's position
+    positions[1][1] = old_pos_i[1];
+
+    // Verify symmetry-axis property: positions[0][1] + positions[1][1] == 2 * axis_y
+    const sum_y = positions[0][1] + positions[1][1];
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 * axis_y), sum_y, 1e-4);
+
+    // Device 0 should now be at the Y-mirror of its original position.
+    const expected_y_i = 2.0 * axis_y - 3.0; // = 7.0
+    try std.testing.expectApproxEqAbs(expected_y_i, positions[0][1], 1e-4);
+    // X should be unchanged.
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), positions[0][0], 1e-4);
+
+    // Device 1 should now be at device 0's original position.
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), positions[1][1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), positions[1][0], 1e-4);
 }

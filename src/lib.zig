@@ -43,11 +43,18 @@ pub const placer_types = struct {
 pub const router = @import("router/lib.zig");
 pub const drc = @import("router/inline_drc.zig");
 pub const maze = @import("router/maze.zig");
+pub const detailed = @import("router/detailed.zig");
 
 pub const steiner = @import("router/steiner.zig");
 pub const lp_sizing = @import("router/lp_sizing.zig");
 
 pub const gdsii = @import("export/gdsii.zig");
+
+// ─── Import modules ─────────────────────────────────────────────────────────
+
+pub const gdsii_reader = @import("import/gdsii.zig");
+pub const template = @import("import/template.zig");
+const template_mod = template;
 
 // ─── Macro / unit-cell recognition ──────────────────────────────────────────
 
@@ -94,6 +101,9 @@ fn computeDeviceDimensions(devices: *DeviceArrays, pdk_cfg: *const PdkConfig) vo
     const gate_pad_w: f32 = 400.0 * db; // 0.400
     const tap_gap_f: f32 = 270.0 * db; // 0.270
     const tap_diff: f32 = 340.0 * db; // 0.340
+    // Guard ring extends ring_spacing + ring_width beyond the device interior.
+    // Must include this so the router blocks M1 cells at guard ring corners.
+    const ring_ext: f32 = pdk_cfg.guard_ring_spacing + pdk_cfg.guard_ring_width;
 
     for (0..n) |i| {
         switch (devices.types[i]) {
@@ -113,20 +123,20 @@ fn computeDeviceDimensions(devices: *DeviceArrays, pdk_cfg: *const PdkConfig) vo
                 // Body tap is centred at x = w_um/2.
                 // For PMOS the NWELL encloses the entire device including body
                 // tap, so use nwell_enc for the right margin (nwell_enc > impl_enc).
-                const left = gate_pad_w + poly_ext; // left of origin
+                const left = gate_pad_w + poly_ext + ring_ext; // left of origin
                 const right_enc = if (is_pmos) nwell_enc_f else impl_enc;
-                const right = w_um + right_enc + poly_ext;
+                const right = w_um + right_enc + poly_ext + ring_ext;
                 const dim_x = left + right;
 
-                // Y-extent: from body tap bottom to drain top + implant.
+                // Y-extent: from body tap bottom to drain top + implant + guard ring.
                 // body_cy = -(sd_ext + tap_gap + tap_half)
                 // Bottom of body tap implant = body_cy - tap_half - impl_enc
                 //   (or - nwell_enc for PMOS)
                 const body_bot_margin = if (is_pmos) nwell_enc_f else impl_enc;
-                const bottom = sd_ext + tap_gap_f + tap_diff + body_bot_margin;
+                const bottom = sd_ext + tap_gap_f + tap_diff + body_bot_margin + ring_ext;
                 // Top: y + l + sd_ext + implant (or + nwell for PMOS)
                 const top_margin = if (is_pmos) nwell_enc_f else impl_enc;
-                const top = l_um + sd_ext + top_margin;
+                const top = l_um + sd_ext + top_margin + ring_ext;
                 const dim_y = bottom + top;
 
                 devices.dimensions[i] = .{ dim_x, dim_y };
@@ -204,6 +214,9 @@ const SpoutContext = struct {
     /// Cached per-pin layout connectivity (component IDs) for FFI.
     layout_connectivity: ?[]u32,
 
+    /// GDS template context; null until spout_load_template_gds is called.
+    template_context: ?*template_mod.TemplateContext,
+
     fn fromHandle(raw: *anyopaque) *SpoutContext {
         return @ptrCast(@alignCast(raw));
     }
@@ -259,6 +272,7 @@ export fn spout_init_layout(backend: u8, pdk_id: u8) ?*anyopaque {
         .lvs_report = null,
         .pex_result = null,
         .layout_connectivity = null,
+        .template_context = null,
     };
 
     return @ptrCast(ctx_ptr);
@@ -302,6 +316,13 @@ export fn spout_destroy(handle: *anyopaque) void {
     // Free characterize results.
     if (ctx.drc_violations) |v| ctx.allocator.free(v);
     if (ctx.pex_result) |p| { p.deinit(); ctx.allocator.destroy(p); }
+
+    // Free template context if loaded.
+    if (ctx.template_context) |tc| {
+        tc.deinit();
+        ctx.allocator.destroy(tc);
+        ctx.template_context = null;
+    }
 
     // Tear down SoA arrays in reverse order of construction.
     if (ctx.adj) |*a| a.deinit();
@@ -696,6 +717,18 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
         sa_config = @as(*align(1) const sa.SaConfig, @ptrCast(cfg_bytes)).*;
     }
 
+    // Apply template hard bounds from ctx.template_context (if loaded).
+    // This overrides whatever use_template_bounds / template_* the caller
+    // set in the SaConfig blob, ensuring the template is always respected.
+    if (ctx.template_context) |tc| {
+        const bounds = tc.getUserAreaBounds();
+        sa_config.template_x_min = bounds[0];
+        sa_config.template_y_min = bounds[1];
+        sa_config.template_x_max = bounds[2];
+        sa_config.template_y_max = bounds[3];
+        sa_config.use_template_bounds = true;
+    }
+
     const n_dev: usize = @intCast(ctx.devices.len);
 
     // ── Compute per-device bounding-box centre offsets ─────────────────
@@ -792,6 +825,8 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
             .dev_a = ctx.constraints.device_a[i].toInt(),
             .dev_b = ctx.constraints.device_b[i].toInt(),
             .axis_x = ctx.constraints.axis[i],
+            .axis_y = 0.0,
+            .param = 0.0,
         };
     }
 
@@ -825,6 +860,7 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
         sa_config,
         42, // deterministic seed
         ctx.allocator,
+        .{},
     ) catch return -4;
 
     // Shift device positions back to GDSII origins (from centres).
@@ -848,6 +884,16 @@ export fn spout_run_sa_hierarchical(handle: *anyopaque, config_ptr: [*]const u8,
     if (config_len == @sizeOf(sa.SaConfig)) {
         const cfg_bytes = config_ptr[0..@sizeOf(sa.SaConfig)];
         sa_config = @as(*align(1) const sa.SaConfig, @ptrCast(cfg_bytes)).*;
+    }
+
+    // Apply template hard bounds from ctx.template_context (if loaded).
+    if (ctx.template_context) |tc| {
+        const bounds = tc.getUserAreaBounds();
+        sa_config.template_x_min = bounds[0];
+        sa_config.template_y_min = bounds[1];
+        sa_config.template_x_max = bounds[2];
+        sa_config.template_y_max = bounds[3];
+        sa_config.use_template_bounds = true;
     }
 
     const n_dev: usize = @intCast(ctx.devices.len);
@@ -917,6 +963,8 @@ export fn spout_run_sa_hierarchical(handle: *anyopaque, config_ptr: [*]const u8,
             .dev_a = ctx.constraints.device_a[i].toInt(),
             .dev_b = ctx.constraints.device_b[i].toInt(),
             .axis_x = ctx.constraints.axis[i],
+            .axis_y = 0.0,
+            .param = 0.0,
         };
     }
 
@@ -942,7 +990,7 @@ export fn spout_run_sa_hierarchical(handle: *anyopaque, config_ptr: [*]const u8,
     } else {
         _ = sa.runSa(
             ctx.devices.positions, ctx.devices.dimensions, pin_info, placer_adj,
-            placer_constraints, bound_w, bound_h, sa_config, 42, ctx.allocator,
+            placer_constraints, bound_w, bound_h, sa_config, 42, ctx.allocator, .{},
         ) catch return -4;
     }
 
@@ -1007,30 +1055,41 @@ export fn spout_run_routing(handle: *anyopaque) i32 {
         ctx.routes = null;
     }
 
-    var maze_router = maze.MazeRouter.init(ctx.allocator, ctx.pdk.db_unit) catch return -3;
+    var detail_router = detailed.DetailedRouter.init(ctx.allocator) catch return -3;
 
-    maze_router.routeAll(
+    detail_router.routeAll(
         &ctx.devices,
         &ctx.nets,
         &ctx.pins,
         adj_ptr,
         &ctx.pdk,
     ) catch {
-        maze_router.deinit();
+        detail_router.deinit();
         return -4;
     };
 
+    // Rip-up-and-reroute: resolve conflicts from net ordering.
+    _ = detailed.ripUpAndReroute(
+        &detail_router,
+        &ctx.devices,
+        &ctx.nets,
+        &ctx.pins,
+        adj_ptr,
+        &ctx.pdk,
+        3,
+    ) catch {};
+
     // Transfer ownership of routes from the router to the context.
-    ctx.routes = maze_router.routes;
+    ctx.routes = detail_router.routes;
     // Prevent the router deinit from freeing the routes we just took.
-    maze_router.routes = route_arrays.RouteArrays.init(ctx.allocator, 0) catch {
+    detail_router.routes = route_arrays.RouteArrays.init(ctx.allocator, 0) catch {
         // If this fails, we need to give back the routes to the router for cleanup.
-        maze_router.routes = ctx.routes.?;
+        detail_router.routes = ctx.routes.?;
         ctx.routes = null;
-        maze_router.deinit();
+        detail_router.deinit();
         return -5;
     };
-    maze_router.deinit();
+    detail_router.deinit();
 
     return 0;
 }
@@ -2403,6 +2462,286 @@ export fn spout_get_pex_totals(
     return 0;
 }
 
+// ─── GDS Template C-ABI ─────────────────────────────────────────────────────
+
+/// Load a GDS template file into the context.
+///
+/// If `cell_name` is null, auto-detects the largest cell (typical for
+/// TinyTapeout wrappers where the top cell is the largest).
+///
+/// Returns 0 on success, -1 invalid handle, -2 OOM, -3 file/parse error.
+export fn spout_load_template_gds(
+    handle: *anyopaque,
+    gds_path: [*:0]const u8,
+    cell_name: ?[*:0]const u8,
+) c_int {
+    const ctx = SpoutContext.fromHandle(handle);
+    if (!ctx.initialized) return -1;
+
+    // Free any previously loaded template.
+    if (ctx.template_context) |old| {
+        old.deinit();
+        ctx.allocator.destroy(old);
+        ctx.template_context = null;
+    }
+
+    const path_slice = std.mem.span(gds_path);
+    const cell_slice: ?[]const u8 = if (cell_name) |cn| std.mem.span(cn) else null;
+
+    const tc_ptr = ctx.allocator.create(template_mod.TemplateContext) catch return -2;
+    errdefer ctx.allocator.destroy(tc_ptr);
+
+    tc_ptr.* = template_mod.TemplateContext.loadFromGds(
+        path_slice,
+        cell_slice,
+        ctx.allocator,
+    ) catch return -3;
+
+    ctx.template_context = tc_ptr;
+    return 0;
+}
+
+/// Get the user-area bounding box from the loaded template.
+///
+/// Writes [xmin, ymin, xmax, ymax] in microns to the provided pointers.
+/// Returns 0 on success, -1 invalid handle, -2 no template loaded.
+export fn spout_get_template_bounds(
+    handle: *const anyopaque,
+    out_xmin: *f32,
+    out_ymin: *f32,
+    out_xmax: *f32,
+    out_ymax: *f32,
+) c_int {
+    const ctx = @as(*const SpoutContext, @ptrCast(@alignCast(handle)));
+    if (!ctx.initialized) return -1;
+    const tc = ctx.template_context orelse return -2;
+    const bounds = tc.getUserAreaBounds();
+    out_xmin.* = bounds[0];
+    out_ymin.* = bounds[1];
+    out_xmax.* = bounds[2];
+    out_ymax.* = bounds[3];
+    return 0;
+}
+
+/// Return the number of pins in the loaded template (0 if none loaded).
+export fn spout_get_template_pin_count(handle: *const anyopaque) u32 {
+    const ctx = @as(*const SpoutContext, @ptrCast(@alignCast(handle)));
+    if (!ctx.initialized) return 0;
+    const tc = ctx.template_context orelse return 0;
+    return @intCast(tc.getPins().len);
+}
+
+/// Copy pin data at index `idx` into the caller-provided TemplatePin struct.
+///
+/// Returns 0 on success, -1 invalid handle, -2 no template, -3 out of range.
+export fn spout_get_template_pin(
+    handle: *const anyopaque,
+    idx: u32,
+    out_pin: *template_mod.TemplatePin,
+) c_int {
+    const ctx = @as(*const SpoutContext, @ptrCast(@alignCast(handle)));
+    if (!ctx.initialized) return -1;
+    const tc = ctx.template_context orelse return -2;
+    const pins = tc.getPins();
+    if (idx >= pins.len) return -3;
+    out_pin.* = pins[idx];
+    return 0;
+}
+
+/// Export GDSII with a template reference hierarchy.
+///
+/// Writes the user circuit as one GDSII cell named `user_cell_name`, then
+/// writes a top cell named `top_cell_name` that references both the loaded
+/// template cell and the user circuit cell via SREF records.
+///
+/// Returns 0 on success, -1 invalid handle, -2 no template loaded,
+/// -3 export error.
+export fn spout_export_gdsii_with_template(
+    handle: *const anyopaque,
+    output_path: [*:0]const u8,
+    user_cell_name: [*:0]const u8,
+    top_cell_name: [*:0]const u8,
+) c_int {
+    const ctx = @as(*const SpoutContext, @ptrCast(@alignCast(handle)));
+    if (!ctx.initialized) return -1;
+    const tc = ctx.template_context orelse return -2;
+
+    const path_slice = std.mem.span(output_path);
+    const user_name_slice = std.mem.span(user_cell_name);
+    const top_name_slice = std.mem.span(top_cell_name);
+
+    // Determine the template cell name for the SREF.
+    const tmpl_cell_name: []const u8 = if (tc.user_cell_idx) |idx|
+        tc.library.cells[idx].name
+    else
+        "template_cell";
+
+    var writer = gdsii.GdsiiWriter.init(ctx.allocator);
+    defer writer.deinit();
+
+    const routes_ptr: ?*const route_arrays.RouteArrays =
+        if (ctx.routes) |*r| r else null;
+
+    // Build net-name slice from parse result for TEXT labels.
+    var net_name_buf: ?[]const []const u8 = null;
+    defer if (net_name_buf) |buf| ctx.allocator.free(buf);
+
+    if (ctx.parse_result) |pr| {
+        if (pr.nets.len > 0) {
+            const names = ctx.allocator.alloc([]const u8, pr.nets.len) catch null;
+            if (names) |ns| {
+                for (pr.nets, 0..) |net, i| ns[i] = net.name;
+                net_name_buf = ns;
+            }
+        }
+    }
+
+    const pins_ptr: ?*const pin_edge_arrays.PinEdgeArrays =
+        if (ctx.pins.len > 0) &ctx.pins else null;
+
+    // Place user circuit at origin (0, 0) within the template user area.
+    const user_origin: [2]f32 = .{ 0.0, 0.0 };
+
+    writer.exportLayoutHierarchical(
+        path_slice,
+        &ctx.devices,
+        routes_ptr,
+        &ctx.pdk,
+        user_name_slice,
+        top_name_slice,
+        tmpl_cell_name,
+        user_origin,
+        net_name_buf,
+        pins_ptr,
+    ) catch return -3;
+
+    return 0;
+}
+
+// ─── Liberty file generation ────────────────────────────────────────────────
+
+const liberty_pdk = @import("liberty/pdk.zig");
+
+/// Map a C integer pdk_id to a liberty PdkCornerSet pointer.
+/// Returns null for unrecognised values.
+/// Mapping: 0 = sky130, 1 = gf180mcu_3v3, 2 = gf180mcu_1v8.
+fn libertyPdkCornerSetFromInt(pdk_id: c_int) ?*const liberty_pdk.PdkCornerSet {
+    return switch (pdk_id) {
+        0 => &liberty_pdk.sky130,
+        1 => &liberty_pdk.gf180mcu_3v3,
+        2 => &liberty_pdk.gf180mcu_1v8,
+        else => null,
+    };
+}
+
+/// Generate a Liberty (.lib) file for one PVT corner.
+///
+/// Parameters:
+///   gds_path    – null-terminated path to GDSII input file
+///   spice_path  – null-terminated path to SPICE netlist
+///   cell_name   – null-terminated cell name (must match .subckt in netlist)
+///   pdk_id      – 0 = sky130, 1 = gf180mcu_3v3, 2 = gf180mcu_1v8
+///   corner_name – null-terminated corner name, e.g. "tt_025C_1v80"
+///   output_path – null-terminated path for the output .lib file
+///
+/// Returns 0 on success, negative error codes:
+///   -1  unknown PDK id or corner not found
+///   -3  could not create output file
+///   -4  Liberty generation failed
+export fn spout_liberty_generate(
+    gds_path: [*:0]const u8,
+    spice_path: [*:0]const u8,
+    cell_name: [*:0]const u8,
+    pdk_id: c_int,
+    corner_name: [*:0]const u8,
+    output_path: [*:0]const u8,
+) c_int {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const corner_set = libertyPdkCornerSetFromInt(pdk_id) orelse return -1;
+
+    // Generate all corners for this PDK then find the one matching corner_name.
+    const corners = corner_set.generateCorners(allocator) catch return -1;
+    defer {
+        for (corners) |c| allocator.free(c.name);
+        allocator.free(corners);
+    }
+
+    const corner_name_span = std.mem.span(corner_name);
+    var found_corner: ?liberty.CornerSpec = null;
+    for (corners) |c| {
+        if (std.mem.eql(u8, c.name, corner_name_span)) {
+            found_corner = c;
+            break;
+        }
+    }
+    const corner = found_corner orelse return -1;
+
+    const base_cfg = liberty.LibertyConfig{};
+    const cfg = liberty.applyCorner(base_cfg, corner);
+
+    const file = std.fs.cwd().createFile(std.mem.span(output_path), .{}) catch return -3;
+    defer file.close();
+
+    var write_buf: [8192]u8 = undefined;
+    var file_writer = file.writer(&write_buf);
+    liberty.generateLiberty(
+        &file_writer.interface,
+        std.mem.span(gds_path),
+        std.mem.span(spice_path),
+        std.mem.span(cell_name),
+        cfg,
+        allocator,
+    ) catch return -4;
+
+    return 0;
+}
+
+/// Generate Liberty (.lib) files for all PVT corners of the given PDK.
+///
+/// Parameters:
+///   gds_path      – null-terminated path to GDSII input file
+///   spice_path    – null-terminated path to SPICE netlist
+///   cell_name     – null-terminated cell name (must match .subckt in netlist)
+///   pdk_id        – 0 = sky130, 1 = gf180mcu_3v3, 2 = gf180mcu_1v8
+///   output_dir    – null-terminated path to output directory (must exist)
+///   out_num_files – on success, written with the number of .lib files generated
+///
+/// Returns 0 on success, negative error codes:
+///   -1  unknown PDK id
+///   -2  Liberty generation failed
+export fn spout_liberty_generate_all_corners(
+    gds_path: [*:0]const u8,
+    spice_path: [*:0]const u8,
+    cell_name: [*:0]const u8,
+    pdk_id: c_int,
+    output_dir: [*:0]const u8,
+    out_num_files: *u32,
+) c_int {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const corner_set = libertyPdkCornerSetFromInt(pdk_id) orelse return -1;
+
+    const base_cfg = liberty.LibertyConfig{};
+
+    const n = liberty.generateLibertyAllCorners(
+        std.mem.span(gds_path),
+        std.mem.span(spice_path),
+        std.mem.span(cell_name),
+        corner_set,
+        std.mem.span(output_dir),
+        base_cfg,
+        allocator,
+    ) catch return -2;
+
+    out_num_files.* = n;
+    return 0;
+}
+
 // ─── Test references ────────────────────────────────────────────────────────
 
 test {
@@ -2439,6 +2778,16 @@ test {
     _ = @import("router/steiner.zig");
     _ = @import("router/lp_sizing.zig");
     _ = @import("router/tests.zig");
+    _ = @import("router/pex_feedback.zig");
+    _ = @import("router/shield_router.zig");
+    _ = @import("router/analog_types.zig");
+    _ = @import("router/spatial_grid.zig");
+    _ = @import("router/analog_router.zig");
+    _ = @import("router/analog_db.zig");
+    _ = @import("router/analog_groups.zig");
+    _ = @import("router/guard_ring.zig");
+    _ = @import("router/matched_router.zig");
+    _ = @import("router/thread_pool.zig");
 
     // Export
     _ = @import("export/gdsii.zig");
@@ -2459,4 +2808,8 @@ test {
     _ = @import("characterize/drc.zig");
     _ = @import("characterize/lvs.zig");
     _ = @import("characterize/pex.zig");
+
+    // GDS import / template
+    _ = @import("import/gdsii.zig");
+    _ = @import("import/template.zig");
 }

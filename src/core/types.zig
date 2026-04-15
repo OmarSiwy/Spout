@@ -100,6 +100,23 @@ pub const ConstraintType = enum(u8) {
     matching = 1,
     proximity = 2,
     isolation = 3,
+    symmetry_y = 4,
+    orientation_match = 5,
+    common_centroid = 6,
+    interdigitation = 7,
+};
+
+/// Standard 8 DEF orientations for placed instances.
+/// N = north (default, no transform), S = south (180°), etc.
+pub const Orientation = enum(u8) {
+    N = 0, // no rotation
+    S = 1, // 180° rotation
+    FN = 2, // flip-north (mirror about Y axis)
+    FS = 3, // flip-south (mirror about Y axis + 180°)
+    E = 4, // 90° clockwise
+    W = 5, // 90° counter-clockwise
+    FE = 6, // flip + 90° CW
+    FW = 7, // flip + 90° CCW
 };
 
 // ─── Device parameters (C-ABI compatible) ─────────────────────────────────────
@@ -157,6 +174,26 @@ pub const DrcViolation = extern struct {
     required: f32,
     rect_a: u32,
     rect_b: u32,
+};
+
+// ─── Template / blocked-region types ─────────────────────────────────────────
+
+/// Hard placement region — devices must be placed entirely within
+pub const PlacementRegion = extern struct {
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+};
+
+/// Blocked routing region — router cannot route through this area on these layers
+pub const BlockedRegion = extern struct {
+    x_min: f32,   // µm
+    y_min: f32,   // µm
+    x_max: f32,   // µm
+    y_max: f32,   // µm
+    layer_mask: u8,  // bitmask: bit 0=LI, bit 1=M1, ... bit 5=M5, 0xFF=all layers
+    _pad: [3]u8 = .{ 0, 0, 0 },  // alignment padding
 };
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -285,6 +322,7 @@ test "ConstraintType enum values" {
     try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ConstraintType.matching));
     try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ConstraintType.proximity));
     try std.testing.expectEqual(@as(u8, 3), @intFromEnum(ConstraintType.isolation));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(ConstraintType.symmetry_y));
 }
 
 test "DrcViolation extern struct field presence" {

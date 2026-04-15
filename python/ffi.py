@@ -364,6 +364,41 @@ class SpoutFFI:
         ]
         lib.spout_get_pex_totals.restype = ctypes.c_int32
 
+        # ── 5.11 GDS Template ────────────────────────────────────────
+        lib.spout_load_template_gds.argtypes = [
+            ctypes.c_void_p,   # handle
+            ctypes.c_char_p,   # gds_path (null-terminated)
+            ctypes.c_char_p,   # cell_name (null-terminated, may be NULL)
+        ]
+        lib.spout_load_template_gds.restype = ctypes.c_int
+
+        lib.spout_get_template_bounds.argtypes = [
+            ctypes.c_void_p,                  # handle (const)
+            ctypes.POINTER(ctypes.c_float),   # out_xmin
+            ctypes.POINTER(ctypes.c_float),   # out_ymin
+            ctypes.POINTER(ctypes.c_float),   # out_xmax
+            ctypes.POINTER(ctypes.c_float),   # out_ymax
+        ]
+        lib.spout_get_template_bounds.restype = ctypes.c_int
+
+        lib.spout_get_template_pin_count.argtypes = [ctypes.c_void_p]
+        lib.spout_get_template_pin_count.restype = ctypes.c_uint32
+
+        lib.spout_get_template_pin.argtypes = [
+            ctypes.c_void_p,   # handle (const)
+            ctypes.c_uint32,   # idx
+            ctypes.c_void_p,   # out_pin (pointer to TemplatePin struct)
+        ]
+        lib.spout_get_template_pin.restype = ctypes.c_int
+
+        lib.spout_export_gdsii_with_template.argtypes = [
+            ctypes.c_void_p,   # handle (const)
+            ctypes.c_char_p,   # output_path (null-terminated)
+            ctypes.c_char_p,   # user_cell_name (null-terminated)
+            ctypes.c_char_p,   # top_cell_name (null-terminated)
+        ]
+        lib.spout_export_gdsii_with_template.restype = ctypes.c_int
+
     # ------------------------------------------------------------------
     # Lifecycle helpers
     # ------------------------------------------------------------------

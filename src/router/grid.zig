@@ -222,6 +222,14 @@ pub const MultiLayerGrid = struct {
         self.* = undefined;
     }
 
+    /// Reset congestion counters on all cells to zero.
+    /// Call this between routing iterations to prevent unbounded growth.
+    pub fn resetCongestion(self: *MultiLayerGrid) void {
+        for (self.cells) |*cell| {
+            cell.congestion = 0;
+        }
+    }
+
     // ─── Cell access ─────────────────────────────────────────────────────
 
     /// Flat index into the cells array for a given GridNode.
@@ -363,7 +371,8 @@ pub const MultiLayerGrid = struct {
     ) void {
         const n_dev: usize = @intCast(devices.len);
 
-        // Pass 0: Block device bounding boxes on all layers.
+        // Pass 0: Block device bounding boxes on M1 only.
+        // M2+ must remain routable above devices for inter-device routing.
         for (0..n_dev) |i| {
             const cx = devices.positions[i][0];
             const cy = devices.positions[i][1];
@@ -372,7 +381,7 @@ pub const MultiLayerGrid = struct {
 
             if (hw <= 0.0 or hh <= 0.0) continue;
 
-            self.markWorldRect(cx - hw, cy - hh, cx + hw, cy + hh, null);
+            self.markWorldRect(cx - hw, cy - hh, cx + hw, cy + hh, 0);
         }
 
         // Block keepout zones around ALL MOSFET terminal positions on M1
@@ -457,6 +466,25 @@ pub const MultiLayerGrid = struct {
                 }
             }
         }
+
+        // Pass 3: Un-block M1 cells at actual pin positions from PinEdgeArrays.
+        // This ensures the grid nodes that PinAccessDB / resolveEndpoint return
+        // are routable, even if hardcoded terminal offsets above don't match.
+        if (pins) |pd| {
+            const pin_len: usize = @intCast(pd.len);
+            for (0..pin_len) |p| {
+                const d = pd.device[p].toInt();
+                if (d >= n_dev) continue;
+                const pin_x = devices.positions[d][0] + pd.position[p][0];
+                const pin_y = devices.positions[d][1] + pd.position[p][1];
+                const node = self.worldToNode(0, pin_x, pin_y);
+                const cell = self.cellAt(node);
+                if (cell.state == .blocked) {
+                    cell.state = .net_owned;
+                    cell.net_owner = pd.net[p];
+                }
+            }
+        }
     }
 
     // ─── Legacy compatibility helpers ────────────────────────────────────
@@ -469,6 +497,30 @@ pub const MultiLayerGrid = struct {
     /// Number of tracks along the cross direction for a given layer.
     pub fn tracksB(self: *const MultiLayerGrid, layer: u8) u32 {
         return self.cross_layers[layer].num_tracks;
+    }
+
+    // ─── Blocked-region marking ───────────────────────────────────────────
+
+    /// Mark all grid cells that overlap any of the provided BlockedRegion entries
+    /// as blocked.  The `layer_mask` field selects which layers to block:
+    ///   bit 0 = layer 0 (LI/M1), bit 1 = layer 1 (M2), …, 0xFF = all layers.
+    /// Only layers present in the grid (< num_layers) are affected.
+    pub fn markBlockedRegions(
+        self: *MultiLayerGrid,
+        regions: [*]const core_types.BlockedRegion,
+        num_regions: u32,
+    ) void {
+        for (0..num_regions) |ri| {
+            const reg = regions[ri];
+            for (0..self.num_layers) |l_idx| {
+                const l: u8 = @intCast(l_idx);
+                // Check layer_mask: bit l must be set (or mask == 0xFF for all).
+                const bit: u8 = @as(u8, 1) << @intCast(l_idx & 7);
+                if (reg.layer_mask != 0xFF and (reg.layer_mask & bit) == 0) continue;
+
+                self.markWorldRect(reg.x_min, reg.y_min, reg.x_max, reg.y_max, l);
+            }
+        }
     }
 };
 
@@ -737,6 +789,14 @@ pub const RoutingGrid = struct {
     pub fn deinit(self: *RoutingGrid) void {
         self.allocator.free(self.cells);
         self.* = undefined;
+    }
+
+    /// Reset congestion counters on all cells to zero.
+    /// Call this between routing iterations to prevent unbounded growth.
+    pub fn resetCongestion(self: *RoutingGrid) void {
+        for (self.cells) |*cell| {
+            cell.congestion = 0;
+        }
     }
 };
 

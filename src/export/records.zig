@@ -30,6 +30,11 @@ pub const RecordType = enum(u16) {
     TEXT = 0x0C00,
     TEXTTYPE = 0x1602,
     STRING = 0x1906,
+    SREF = 0x0A00,
+    SNAME = 0x1206,
+    STRANS = 0x1A02,
+    AMAG = 0x1B05,
+    AANGLE = 0x1C05,
 
     /// Extract the record-type byte (high byte of the combined value).
     pub fn recordByte(self: RecordType) u8 {

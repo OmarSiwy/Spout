@@ -133,6 +133,53 @@ pub fn applyCorner(base: LibertyConfig, corner: CornerSpec) LibertyConfig {
     return cfg;
 }
 
+/// Generate Liberty files for all PVT corners of the given PDK.
+///
+/// For each corner produced by `pdk_corner_set.generateCorners()`, applies the
+/// corner to a base `LibertyConfig`, writes output to
+/// `{output_dir}/{cell_name}_{corner.name}.lib`, and returns the count of files
+/// generated.
+///
+/// The `output_dir` must already exist; this function does not create it.
+pub fn generateLibertyAllCorners(
+    gds_path: []const u8,
+    spice_path: []const u8,
+    cell_name: []const u8,
+    pdk_corner_set: *const @import("pdk.zig").PdkCornerSet,
+    output_dir: []const u8,
+    base_config: LibertyConfig,
+    allocator: std.mem.Allocator,
+) !u32 {
+    const corners = try pdk_corner_set.generateCorners(allocator);
+    defer {
+        for (corners) |c| allocator.free(c.name);
+        allocator.free(corners);
+    }
+
+    var count: u32 = 0;
+    for (corners) |corner| {
+        const cfg = applyCorner(base_config, corner);
+
+        // Build output path: {output_dir}/{cell_name}_{corner.name}.lib
+        const out_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}_{s}.lib",
+            .{ output_dir, cell_name, corner.name },
+        );
+        defer allocator.free(out_path);
+
+        const file = try std.fs.cwd().createFile(out_path, .{});
+        defer file.close();
+
+        var write_buf: [8192]u8 = undefined;
+        var file_writer = file.writer(&write_buf);
+        try generateLiberty(&file_writer.interface, gds_path, spice_path, cell_name, cfg, allocator);
+        count += 1;
+    }
+
+    return count;
+}
+
 // ─── Pull in all sub-module tests ───────────────────────────────────────────
 
 comptime {
@@ -148,8 +195,8 @@ test "generateLiberty integration: synthetic cell produces valid Liberty" {
     const alloc = std.testing.allocator;
     const NldmTable = types.NldmTable;
     const PgPin = types.PgPin;
-    var buf = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
 
     const cr = try NldmTable.scalar(alloc, 7, 7, 0.045);
     defer cr.deinit(alloc);
@@ -203,7 +250,7 @@ test "generateLiberty integration: synthetic cell produces valid Liberty" {
     };
 
     const config = LibertyConfig{};
-    try writer.writeLiberty(buf.writer(), &cell, config);
+    try writer.writeLiberty(buf.writer(alloc), &cell, config);
 
     const output = buf.items;
     const testing = std.testing;

@@ -57,6 +57,30 @@ pub fn build(b: *std.Build) void {
     // Make "zig build test" also run e2e tests
     test_step.dependOn(&run_e2e.step);
 
+    // Liberty-specific unit tests (includes GDS template import tests)
+    const liberty_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/liberty/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_liberty_tests = b.addRunArtifact(liberty_tests);
+    const liberty_test_step = b.step("test-liberty", "Run liberty unit tests");
+    liberty_test_step.dependOn(&run_liberty_tests.step);
+
+    // Template import tests
+    const template_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/import/template.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_template_tests = b.addRunArtifact(template_tests);
+    const template_test_step = b.step("test-template", "Run GDS template import tests");
+    template_test_step.dependOn(&run_template_tests.step);
+
     // Custom test runner (pass/fail display with tick marks)
     const test_runner_tests = b.addTest(.{
         .name = "test-runner",

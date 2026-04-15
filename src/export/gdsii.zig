@@ -137,11 +137,11 @@ pub const GdsiiWriter = struct {
             try self.writeRoutes(writer, r, pdk);
         }
 
-        // Write TEXT labels for net identification (needed by KLayout LVS)
+        // Write TEXT labels for net identification (needed by KLayout LVS).
+        // Always call writeNetLabels when net_names exists — Pass 1 is a no-op
+        // if routes is null/empty, but Pass 2 (device pin labels) still runs.
         if (net_names) |names| {
-            if (routes) |r| {
-                try writeNetLabels(writer, r, pdk, names, pins, devices);
-            }
+            try writeNetLabels(writer, routes, pdk, names, pins, devices);
         }
 
         // Write footer
@@ -300,10 +300,19 @@ pub const GdsiiWriter = struct {
             }
         }
 
-        // Merge and emit NWELL, NSDM, PSDM rects.
-        try emitMergedRects(writer, pdk.layers.nwell, nwell_rects.items, self.allocator);
-        try emitMergedRects(writer, pdk.layers.nsdm, nsdm_rects.items, self.allocator);
-        try emitMergedRects(writer, pdk.layers.psdm, psdm_rects.items, self.allocator);
+        // Emit NWELL, NSDM, PSDM rects individually (no merge).
+        // Merging used bounding-box union which added phantom area and caused
+        // KLayout LVS to short unrelated nets through a shared NWELL polygon.
+        // GDS tools handle overlapping polygons correctly on their own.
+        for (nwell_rects.items) |r| {
+            try writeRect(writer, pdk.layers.nwell, r[0], r[1], r[2], r[3]);
+        }
+        for (nsdm_rects.items) |r| {
+            try writeRect(writer, pdk.layers.nsdm, r[0], r[1], r[2], r[3]);
+        }
+        for (psdm_rects.items) |r| {
+            try writeRect(writer, pdk.layers.psdm, r[0], r[1], r[2], r[3]);
+        }
     }
 
     fn writeRoutes(self: *GdsiiWriter, writer: anytype, routes: *const RouteArrays, pdk: *const PdkConfig) !void {
@@ -450,6 +459,144 @@ pub const GdsiiWriter = struct {
         try records.writeRecord(writer, records.RecordType.ENDSTR, &[_]u8{});
         // ENDLIB
         try records.writeRecord(writer, records.RecordType.ENDLIB, &[_]u8{});
+    }
+
+    /// Write a SREF (structure reference / instance) element into an already-open
+    /// structure.  The caller must have written BGNSTR/STRNAME already and must
+    /// write ENDSTR after.
+    ///
+    /// `x_db`, `y_db`     – placement origin in database units.
+    /// `angle_deg`        – counter-clockwise rotation in degrees (0.0 = no rotation).
+    /// `magnification`    – scaling factor (1.0 = no scaling).
+    /// `mirror_x`         – reflect about the X axis before rotation.
+    pub fn writeSref(
+        writer: anytype,
+        cell_name: []const u8,
+        x_db: i32,
+        y_db: i32,
+        angle_deg: f64,
+        magnification: f64,
+        mirror_x: bool,
+    ) !void {
+        // SREF element start (no payload)
+        try records.writeRecord(writer, records.RecordType.SREF, &[_]u8{});
+
+        // SNAME — the cell being referenced
+        try records.writeStringRecord(writer, records.RecordType.SNAME, cell_name);
+
+        // STRANS / AMAG / AANGLE — only when the transform is non-identity
+        if (mirror_x or magnification != 1.0 or angle_deg != 0.0) {
+            // STRANS flags: bit 15 = mirror about X axis
+            const strans_flags: u16 = if (mirror_x) 0x8000 else 0x0000;
+            try records.writeInt16Record(writer, records.RecordType.STRANS, @bitCast(strans_flags));
+
+            if (magnification != 1.0) {
+                const mag_bytes = records.toGdsiiReal(magnification);
+                try records.writeRecord(writer, records.RecordType.AMAG, &mag_bytes);
+            }
+
+            if (angle_deg != 0.0) {
+                const angle_bytes = records.toGdsiiReal(angle_deg);
+                try records.writeRecord(writer, records.RecordType.AANGLE, &angle_bytes);
+            }
+        }
+
+        // XY — single coordinate pair (8 bytes, two big-endian i32)
+        var xy_buf: [8]u8 = undefined;
+        std.mem.writeInt(i32, xy_buf[0..4], x_db, .big);
+        std.mem.writeInt(i32, xy_buf[4..8], y_db, .big);
+        try records.writeRecord(writer, records.RecordType.XY, &xy_buf);
+
+        // ENDEL
+        try records.writeRecord(writer, records.RecordType.ENDEL, &[_]u8{});
+    }
+
+    /// Export a hierarchical GDS with two cells:
+    ///   1. `user_cell_name`  — the analog circuit geometry (identical to flat export).
+    ///   2. `top_cell_name`   — a wrapper cell that contains:
+    ///        • SREF to `template_cell_name` at the origin (0, 0).
+    ///        • SREF to `user_cell_name` at `user_area_origin` (µm).
+    ///
+    /// The template cell itself is NOT written here; it is expected to exist in a
+    /// separately-loaded template GDS file.  This output GDS should be merged with
+    /// that file in the sign-off flow.
+    ///
+    /// `user_area_origin` – [x, y] offset in **micrometres** where the user circuit
+    ///                      lands within the template coordinate system.
+    /// `db_unit`          – database unit in **metres** (e.g. 1e-9 for sky130 with
+    ///                      1 nm resolution).  Used to convert µm → integer db units.
+    pub fn exportLayoutHierarchical(
+        self: *GdsiiWriter,
+        path: []const u8,
+        devices: *const DeviceArrays,
+        routes: ?*const RouteArrays,
+        pdk: *const PdkConfig,
+        user_cell_name: []const u8,
+        top_cell_name: []const u8,
+        template_cell_name: []const u8,
+        user_area_origin: [2]f32,
+        net_names: ?[]const []const u8,
+        pins: ?*const PinEdgeArrays,
+    ) !void {
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        var write_buffer: [8192]u8 = undefined;
+        var file_writer = file.writer(&write_buffer);
+        const writer = &file_writer.interface;
+
+        // ── Library header (HEADER, BGNLIB, LIBNAME, UNITS) ──────────────────
+        // We reuse writeHeader but it also emits BGNSTR+STRNAME for the first
+        // cell.  Instead we replicate only the lib-level records here so we
+        // can open two separate structure blocks ourselves.
+        const timestamp = [_]u8{ 0x00, 0x01 } ** 12;
+
+        try records.writeInt16Record(writer, records.RecordType.HEADER, 600);
+        try records.writeRecord(writer, records.RecordType.BGNLIB, &timestamp);
+        try records.writeStringRecord(writer, records.RecordType.LIBNAME, "spout_layout");
+
+        const db_unit_um: f64 = @floatCast(pdk.db_unit);
+        const db_unit_m: f64 = db_unit_um * 1.0e-6;
+        var units_data: [16]u8 = undefined;
+        @memcpy(units_data[0..8], &records.toGdsiiReal(db_unit_um));
+        @memcpy(units_data[8..16], &records.toGdsiiReal(db_unit_m));
+        try records.writeRecord(writer, records.RecordType.UNITS, &units_data);
+
+        // ── Cell 1: user circuit geometry ─────────────────────────────────────
+        try records.writeRecord(writer, records.RecordType.BGNSTR, &timestamp);
+        const uname = if (user_cell_name.len > 0) user_cell_name else "USER";
+        try records.writeStringRecord(writer, records.RecordType.STRNAME, uname);
+
+        try self.writeDevices(writer, devices, pdk);
+        if (routes) |r| {
+            try self.writeRoutes(writer, r, pdk);
+        }
+        if (net_names) |names| {
+            try writeNetLabels(writer, routes, pdk, names, pins, devices);
+        }
+
+        try records.writeRecord(writer, records.RecordType.ENDSTR, &[_]u8{});
+
+        // ── Cell 2: top wrapper — two SREFs ───────────────────────────────────
+        try records.writeRecord(writer, records.RecordType.BGNSTR, &timestamp);
+        const tname = if (top_cell_name.len > 0) top_cell_name else "TOP";
+        try records.writeStringRecord(writer, records.RecordType.STRNAME, tname);
+
+        // SREF to template at origin
+        try GdsiiWriter.writeSref(writer, template_cell_name, 0, 0, 0.0, 1.0, false);
+
+        // SREF to user circuit at user_area_origin (µm → db units)
+        // db_unit is µm per db unit (pdk.db_unit), so: db = µm / db_unit_um
+        const x_db: i32 = @intFromFloat(@round(@as(f64, user_area_origin[0]) / db_unit_um));
+        const y_db: i32 = @intFromFloat(@round(@as(f64, user_area_origin[1]) / db_unit_um));
+        try GdsiiWriter.writeSref(writer, uname, x_db, y_db, 0.0, 1.0, false);
+
+        try records.writeRecord(writer, records.RecordType.ENDSTR, &[_]u8{});
+
+        // ── End of library ────────────────────────────────────────────────────
+        try records.writeRecord(writer, records.RecordType.ENDLIB, &[_]u8{});
+
+        try writer.flush();
     }
 
     pub fn deinit(self: *GdsiiWriter) void {
@@ -1034,7 +1181,7 @@ fn mapPinLayer(layers: LayerTable, idx: u8) GdsLayer {
 /// midpoint of the first non-degenerate route segment found for that net.
 ///
 /// This ensures KLayout LVS can identify each net by name.
-fn writeNetLabels(writer: anytype, routes: *const RouteArrays, pdk: *const PdkConfig, net_names: []const []const u8, pins: ?*const PinEdgeArrays, devices: *const DeviceArrays) !void {
+fn writeNetLabels(writer: anytype, routes: ?*const RouteArrays, pdk: *const PdkConfig, net_names: []const []const u8, pins: ?*const PinEdgeArrays, devices: *const DeviceArrays) !void {
     const scale: f32 = 1.0 / pdk.db_unit;
 
     // Track which nets have already been labelled (one label per net is
@@ -1044,30 +1191,32 @@ fn writeNetLabels(writer: anytype, routes: *const RouteArrays, pdk: *const PdkCo
     var labelled = [_]bool{false} ** max_nets;
 
     // Pass 1: label nets from route segments (preferred — label at midpoint
-    // of the first non-degenerate segment).
-    const n: usize = @intCast(routes.len);
-    for (0..n) |i| {
-        const net_idx = routes.net[i].toInt();
+    // of the first non-degenerate segment).  Skip entirely if routes is null.
+    if (routes) |r| {
+        const n: usize = @intCast(r.len);
+        for (0..n) |i| {
+            const net_idx = r.net[i].toInt();
 
-        if (net_idx >= max_nets) continue;
-        if (labelled[net_idx]) continue;
-        if (net_idx >= net_names.len) continue;
-        const name = net_names[net_idx];
-        if (name.len == 0) continue;
+            if (net_idx >= max_nets) continue;
+            if (labelled[net_idx]) continue;
+            if (net_idx >= net_names.len) continue;
+            const name = net_names[net_idx];
+            if (name.len == 0) continue;
 
-        const sx: i32 = @intFromFloat(@round(routes.x1[i] * scale));
-        const sy: i32 = @intFromFloat(@round(routes.y1[i] * scale));
-        const ex: i32 = @intFromFloat(@round(routes.x2[i] * scale));
-        const ey: i32 = @intFromFloat(@round(routes.y2[i] * scale));
+            const sx: i32 = @intFromFloat(@round(r.x1[i] * scale));
+            const sy: i32 = @intFromFloat(@round(r.y1[i] * scale));
+            const ex: i32 = @intFromFloat(@round(r.x2[i] * scale));
+            const ey: i32 = @intFromFloat(@round(r.y2[i] * scale));
 
-        if (sx == ex and sy == ey) continue;
+            if (sx == ex and sy == ey) continue;
 
-        const mx = midpointI32(sx, ex);
-        const my = midpointI32(sy, ey);
+            const mx = midpointI32(sx, ex);
+            const my = midpointI32(sy, ey);
 
-        const pin_layer = mapPinLayer(pdk.layers, routes.layer[i]);
-        try writeTextElement(writer, pin_layer, mx, my, name);
-        labelled[net_idx] = true;
+            const pin_layer = mapPinLayer(pdk.layers, r.layer[i]);
+            try writeTextElement(writer, pin_layer, mx, my, name);
+            labelled[net_idx] = true;
+        }
     }
 
     // Pass 2: for nets that have no route segments (e.g. single-pin nets
@@ -1092,10 +1241,10 @@ fn writeNetLabels(writer: anytype, routes: *const RouteArrays, pdk: *const PdkCo
             const px: i32 = @intFromFloat(@round((dx + p.position[i][0]) * scale));
             const py: i32 = @intFromFloat(@round((dy + p.position[i][1]) * scale));
 
-            // Use LI pin layer for device-level labels (devices connect
-            // to the routing stack through LI / LICON).
-            const li_pin = pdk.layers.li_pin;
-            try writeTextElement(writer, li_pin, px, py, name);
+            // Use M1 pin layer for device-level labels — matches device M1 pads
+            // so KLayout LVS can reliably associate labels with port connectivity.
+            const pin_layer = pdk.layers.metal_pin[0];
+            try writeTextElement(writer, pin_layer, px, py, name);
             labelled[net_idx] = true;
         }
     }
