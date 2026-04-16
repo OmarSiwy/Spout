@@ -3,6 +3,7 @@ const types = @import("types.zig");
 
 const DeviceType = types.DeviceType;
 const DeviceParams = types.DeviceParams;
+const Orientation = types.Orientation;
 
 pub const DeviceArrays = struct {
     types: []DeviceType,
@@ -11,6 +12,8 @@ pub const DeviceArrays = struct {
     dimensions: [][2]f32,
     embeddings: [][64]f32,
     predicted_cap: []f32,
+    orientations: []Orientation,
+    is_dummy: []bool,
     allocator: std.mem.Allocator,
     len: u32,
 
@@ -42,6 +45,14 @@ pub const DeviceArrays = struct {
         errdefer allocator.free(pcap);
         @memset(pcap, 0.0);
 
+        const orients = try allocator.alloc(Orientation, n);
+        errdefer allocator.free(orients);
+        @memset(orients, .N);
+
+        const dummy = try allocator.alloc(bool, n);
+        errdefer allocator.free(dummy);
+        @memset(dummy, false);
+
         return DeviceArrays{
             .types = dev_types,
             .params = dev_params,
@@ -49,6 +60,8 @@ pub const DeviceArrays = struct {
             .dimensions = dims,
             .embeddings = embeds,
             .predicted_cap = pcap,
+            .orientations = orients,
+            .is_dummy = dummy,
             .allocator = allocator,
             .len = count,
         };
@@ -62,6 +75,8 @@ pub const DeviceArrays = struct {
         self.allocator.free(self.dimensions);
         self.allocator.free(self.embeddings);
         self.allocator.free(self.predicted_cap);
+        self.allocator.free(self.orientations);
+        self.allocator.free(self.is_dummy);
         self.* = undefined;
     }
 };

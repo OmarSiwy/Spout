@@ -88,17 +88,9 @@ pub const PinEdgeArrays = struct {
         // Minimum dimension so offsets are non-zero even when w/l are unset.
         const default_dim: f32 = 1.0;
 
-        // Geometry-derived offsets (µm) matching physical contact positions
-        // in gdsii.zig.  These are constants derived from the sky130 geometry:
-        //   sd_contact_y  = sd_extension/2 * db_unit = 260/2 * 0.001 = 0.13
-        //   sd_ext_um     = sd_extension * db_unit = 260 * 0.001 = 0.26
-        //   gate_contact_x = gate_pad_width/2 * db_unit = 400/2 * 0.001 = 0.20
-        //   body_tap_y    = (sd_extension + tap_gap + tap_diff_size/2) * db_unit
-        //                 = (260 + 270 + 170) * 0.001 = 0.70
-        const sd_contact_y: f32 = 0.13;
-        const sd_ext_um: f32 = 0.26;
+        // Gate contact x-offset: gate_pad_width/2 * db_unit = 400/2 * 0.001 = 0.20 µm.
+        // Constant — does not depend on channel length.
         const gate_contact_x: f32 = 0.20;
-        const body_tap_y: f32 = 0.70;
 
         for (0..n) |i| {
             const dev_raw: u32 = self.device[i].toInt();
@@ -136,14 +128,23 @@ pub const PinEdgeArrays = struct {
                     //                     = nf*(l_scaled+sd_ext_um) - sd_contact_y
                     // Gate bus centre (from gdsii.zig gate_cy derivation):
                     //   = ((nf-1)*(l+sd_ext) + l) / 2
-                    const drain_y = nf * (l_scaled + sd_ext_um) - sd_contact_y;
-                    const gate_y = ((nf - 1.0) * (l_scaled + sd_ext_um) + l_scaled) * 0.5;
+                    // Effective sd_extension matching effectiveSdExtension(l) in gdsii.zig:
+                    //   raw = max(sd_ext_base, 2*(licon_half + m1_pad_enc) + m1_min_spacing - l)
+                    //       = max(0.26, 0.39 - l_scaled)
+                    // Rounded to nearest 0.002 µm (even db_unit) as in gdsii.zig.
+                    const raw_sd: f32 = @max(0.26, 0.39 - l_scaled);
+                    const eff_sd_ext_um: f32 = @ceil(raw_sd / 0.002) * 0.002;
+                    const sd_contact_y: f32 = eff_sd_ext_um * 0.5;
+                    const body_tap_y: f32 = eff_sd_ext_um + 0.44;
+
+                    const drain_y = nf * (l_scaled + eff_sd_ext_um) - sd_contact_y;
+                    const gate_y = ((nf - 1.0) * (l_scaled + eff_sd_ext_um) + l_scaled) * 0.5;
 
                     self.position[i] = switch (self.terminal[i]) {
                         .gate => .{ -gate_contact_x, gate_y },
                         .source => .{ w_scaled * 0.5, -sd_contact_y },
                         .drain => .{ w_scaled * 0.5, drain_y },
-                        .body => .{ w_scaled * 0.5, -body_tap_y },
+                        .body => .{ 0.0, -body_tap_y },
                         // Fallback for unexpected terminal types on a MOSFET.
                         .anode => .{ -w_scaled * 0.5, 0.0 },
                         .cathode => .{ w_scaled * 0.5, 0.0 },
@@ -347,8 +348,8 @@ test "computePinOffsets MOSFET with SI dimensions" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), pa.position[2][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -0.13), pa.position[2][1], 1e-6);
 
-    // body at (w/2, -0.70)
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), pa.position[3][0], 1e-6);
+    // body at (0, -0.70) — x_tap = x (left edge of device)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pa.position[3][0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -0.70), pa.position[3][1], 1e-6);
 }
 

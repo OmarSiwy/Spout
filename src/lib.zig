@@ -707,14 +707,23 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
     if (!ctx.initialized) return -1;
     if (ctx.devices.len == 0) return 0; // nothing to place
 
-    // Parse optional JSON-like configuration (for now we accept a raw SaConfig
-    // blob or fall back to defaults).
+    // Parse optional configuration blob (raw C-ABI SaConfig bytes or prefix).
+    // Start with defaults; overlay with whatever the caller provided.
     var sa_config = sa.SaConfig{};
 
-    if (config_len == @sizeOf(sa.SaConfig)) {
-        // Treat the buffer as a raw SaConfig struct.
-        const cfg_bytes = config_ptr[0..@sizeOf(sa.SaConfig)];
+    // The Python _SaConfigC ABI covers exactly the first 25 fields of SaConfig
+    // (100 bytes).  Accept any buffer that is at least that large: copy up to
+    // @sizeOf(sa.SaConfig) bytes, leaving unset Zig-only fields at defaults.
+    const sa_config_size = @sizeOf(sa.SaConfig);
+    if (config_len >= sa_config_size) {
+        // Caller sent the full (or larger) struct — straight ptrcast.
+        const cfg_bytes = config_ptr[0..sa_config_size];
         sa_config = @as(*align(1) const sa.SaConfig, @ptrCast(cfg_bytes)).*;
+    } else if (config_len > 0) {
+        // Caller sent a prefix (e.g. the 100-byte Python ABI blob).
+        // Overlay only the bytes that were provided; the rest stay at defaults.
+        const dst_bytes = std.mem.asBytes(&sa_config);
+        @memcpy(dst_bytes[0..config_len], config_ptr[0..config_len]);
     }
 
     // Apply template hard bounds from ctx.template_context (if loaded).
@@ -849,6 +858,99 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
     const avg_dim = (sum_w / @as(f32, @floatFromInt(ctx.devices.len)) + max_h) * 0.5;
     sa_config.perturbation_range = @max(avg_dim * 0.5, 1.0);
 
+    // ── P1-A: Populate SaExtendedInput from available context data ────────────
+    //
+    // Derive heat_sources, centroid_groups, interdigitation_groups, and
+    // well_regions from the device list and constraint database so that those
+    // four SA cost terms contribute non-zero values.
+
+    // heat_sources: one per MOSFET at its (centre) position; power = 1.0.
+    // In Zig 0.15 std.ArrayList is the unmanaged type; use .empty init and
+    // pass allocator explicitly to append/deinit.
+    var heat_sources_list: std.ArrayList(cost.HeatSource) = .empty;
+    defer heat_sources_list.deinit(ctx.allocator);
+    for (0..n_dev) |di| {
+        switch (ctx.devices.types[di]) {
+            .nmos, .pmos => {
+                heat_sources_list.append(ctx.allocator, .{
+                    .x = ctx.devices.positions[di][0],
+                    .y = ctx.devices.positions[di][1],
+                    .power = 1.0,
+                }) catch break;
+            },
+            else => {},
+        }
+    }
+
+    // well_regions: one NWELL per PMOS device derived from its position and dimensions.
+    var well_regions_list: std.ArrayList(cost.WellRegion) = .empty;
+    defer well_regions_list.deinit(ctx.allocator);
+    for (0..n_dev) |di| {
+        if (ctx.devices.types[di] == .pmos) {
+            const px = ctx.devices.positions[di][0];
+            const py = ctx.devices.positions[di][1];
+            const dw = if (ctx.devices.dimensions[di][0] > 0.0) ctx.devices.dimensions[di][0] else 2.0;
+            const dh = if (ctx.devices.dimensions[di][1] > 0.0) ctx.devices.dimensions[di][1] else 2.0;
+            well_regions_list.append(ctx.allocator, .{
+                .x_min = px - dw * 0.5,
+                .y_min = py - dh * 0.5,
+                .x_max = px + dw * 0.5,
+                .y_max = py + dh * 0.5,
+                .well_type = .nwell,
+            }) catch break;
+        }
+    }
+
+    // centroid_groups and interdigitation_groups: built from matching constraints.
+    // Devices sharing the same non-zero group_id under a common_centroid /
+    // interdigitation constraint are collected into CentroidGroup sidecar entries.
+    var centroid_list: std.ArrayList(cost.CentroidGroup) = .empty;
+    defer centroid_list.deinit(ctx.allocator);
+    var interdig_list: std.ArrayList(cost.CentroidGroup) = .empty;
+    defer interdig_list.deinit(ctx.allocator);
+
+    // Collect device index pairs per group_id for each relevant constraint type.
+    // Use simple O(n_con^2) grouping (analog circuits have <100 constraints).
+    {
+        // We store group_a and group_b as heap slices so CentroidGroup can own them.
+        // Allocate from ctx.allocator; lifetime matches the sa.runSa call below.
+        var gid_set = std.AutoHashMap(u32, struct { a: u32, b: u32 }).init(ctx.allocator);
+        defer gid_set.deinit();
+
+        for (0..@as(usize, @intCast(ctx.constraints.len))) |ci| {
+            const ctype = ctx.constraints.types[ci];
+            const gid = ctx.constraints.group_id[ci];
+            if (gid == 0) continue;
+
+            if (ctype == .common_centroid or ctype == .interdigitation) {
+                const da = ctx.constraints.device_a[ci].toInt();
+                const db = ctx.constraints.device_b[ci].toInt();
+                if (!gid_set.contains(gid)) {
+                    gid_set.put(gid, .{ .a = da, .b = db }) catch continue;
+
+                    const a_slice = ctx.allocator.dupe(u32, &[_]u32{da}) catch continue;
+                    const b_slice = ctx.allocator.dupe(u32, &[_]u32{db}) catch {
+                        ctx.allocator.free(a_slice);
+                        continue;
+                    };
+                    const grp = cost.CentroidGroup{ .group_a = a_slice, .group_b = b_slice };
+                    if (ctype == .common_centroid) {
+                        centroid_list.append(ctx.allocator, grp) catch {};
+                    } else {
+                        interdig_list.append(ctx.allocator, grp) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    const sa_extended = sa.SaExtendedInput{
+        .heat_sources = heat_sources_list.items,
+        .well_regions = well_regions_list.items,
+        .centroid_groups = centroid_list.items,
+        .interdigitation_groups = interdig_list.items,
+    };
+
     const result = sa.runSa(
         ctx.devices.positions,
         ctx.devices.dimensions,
@@ -860,13 +962,36 @@ export fn spout_run_sa_placement(handle: *anyopaque, config_ptr: [*]const u8, co
         sa_config,
         42, // deterministic seed
         ctx.allocator,
-        .{},
+        sa_extended,
     ) catch return -4;
+
+    // Free the group_a/group_b slices allocated above for centroid/interdig groups.
+    for (centroid_list.items) |grp| {
+        ctx.allocator.free(@constCast(grp.group_a));
+        ctx.allocator.free(@constCast(grp.group_b));
+    }
+    for (interdig_list.items) |grp| {
+        ctx.allocator.free(@constCast(grp.group_a));
+        ctx.allocator.free(@constCast(grp.group_b));
+    }
 
     // Shift device positions back to GDSII origins (from centres).
     for (0..n_dev) |di| {
         ctx.devices.positions[di][0] -= centre_offsets[di][0];
         ctx.devices.positions[di][1] -= centre_offsets[di][1];
+    }
+
+    // Update pin offsets to reflect final device orientations.
+    // pins.position stores device-local offsets; the router adds devices.positions itself.
+    // We only need to apply the orientation rotation to the local offset.
+    for (0..n_pin) |pi| {
+        const dev_raw = ctx.pins.device[pi].toInt();
+        if (dev_raw >= n_dev) continue;
+        const orient = ctx.devices.orientations[dev_raw];
+        const local_ox = ctx.pins.position[pi][0];
+        const local_oy = ctx.pins.position[pi][1];
+        const rotated = cost.transformPinOffset(local_ox, local_oy, orient);
+        ctx.pins.position[pi] = .{ rotated[0], rotated[1] };
     }
 
     _ = result;
@@ -881,9 +1006,13 @@ export fn spout_run_sa_hierarchical(handle: *anyopaque, config_ptr: [*]const u8,
     if (ctx.devices.len == 0) return 0;
 
     var sa_config = sa.SaConfig{};
-    if (config_len == @sizeOf(sa.SaConfig)) {
-        const cfg_bytes = config_ptr[0..@sizeOf(sa.SaConfig)];
+    const sa_config_size_h = @sizeOf(sa.SaConfig);
+    if (config_len >= sa_config_size_h) {
+        const cfg_bytes = config_ptr[0..sa_config_size_h];
         sa_config = @as(*align(1) const sa.SaConfig, @ptrCast(cfg_bytes)).*;
+    } else if (config_len > 0) {
+        const dst_bytes = std.mem.asBytes(&sa_config);
+        @memcpy(dst_bytes[0..config_len], config_ptr[0..config_len]);
     }
 
     // Apply template hard bounds from ctx.template_context (if loaded).
@@ -1160,6 +1289,8 @@ export fn spout_export_gdsii_named(handle: *anyopaque, path_ptr: [*]const u8, pa
     const routes_ptr: ?*const route_arrays.RouteArrays = if (ctx.routes) |*r| r else null;
 
     // Build net-name slice from parse result for TEXT labels (KLayout LVS).
+    // Only label PORT nets (subcircuit ports) — internal nets must not get
+    // pin-layer labels or KLayout LVS will promote them to subcircuit ports.
     var net_name_buf: ?[]const []const u8 = null;
     defer if (net_name_buf) |buf| ctx.allocator.free(buf);
 
@@ -1167,8 +1298,19 @@ export fn spout_export_gdsii_named(handle: *anyopaque, path_ptr: [*]const u8, pa
         if (pr.nets.len > 0) {
             const names = ctx.allocator.alloc([]const u8, pr.nets.len) catch null;
             if (names) |ns| {
-                for (pr.nets, 0..) |net, i| {
-                    ns[i] = net.name;
+                // Default: no label for any net.
+                for (ns) |*n| n.* = "";
+                // Mark only port nets of the top-level subcircuit.
+                if (pr.subcircuits.len > 0) {
+                    for (pr.subcircuits[0].ports) |port_name| {
+                        if (pr.net_table.get(port_name)) |nidx| {
+                            const ni = nidx.toInt();
+                            if (ni < ns.len) ns[ni] = pr.nets[ni].name;
+                        }
+                    }
+                } else {
+                    // No subcircuit info — fall back to labelling all nets.
+                    for (pr.nets, 0..) |net, i| ns[i] = net.name;
                 }
                 net_name_buf = ns;
             }
@@ -2029,6 +2171,121 @@ export fn spout_get_layout_connectivity(handle: *anyopaque) Span(u32) {
     }
 }
 
+/// Generate a layout SPICE netlist from physical route connectivity.
+/// Net names reflect which pins are physically connected in the routed layout
+/// rather than the schematic net assignment, exposing opens and shorts.
+/// Returns 0 on success: -1 invalid handle, -2 OOM, -3 no parse result,
+/// -4 write error, -5 format error.
+export fn spout_generate_layout_spice(
+    handle: *anyopaque,
+    out_path_ptr: [*]const u8,
+    out_path_len: usize,
+) i32 {
+    const ctx = SpoutContext.fromHandle(handle);
+    if (!ctx.initialized) return -1;
+    const pr = if (ctx.parse_result) |*p| p else return -3;
+    if (pr.subcircuits.len == 0) return -3;
+
+    const n_pins: usize = @intCast(ctx.pins.len);
+    const n_nets: usize = pr.nets.len;
+    if (n_pins == 0 or n_nets == 0) return -3;
+
+    // ── 1. Get or compute layout connectivity ──────────────────────────────
+    const conn: []const u32 = blk: {
+        if (ctx.layout_connectivity) |c| break :blk c;
+        if (ctx.routes) |*routes| {
+            const num_routes: usize = @intCast(routes.len);
+            const total_nodes: u32 = @intCast(num_routes + n_pins);
+            var uf = characterize.UnionFind.init(ctx.allocator, total_nodes) catch return -2;
+            defer uf.deinit();
+            const PHYS_TOL: f32 = 0.1;
+            for (0..num_routes) |ri| {
+                for (ri + 1..num_routes) |rj| {
+                    const li = routes.layer[ri];
+                    const lj = routes.layer[rj];
+                    const d = if (li > lj) li - lj else lj - li;
+                    if (d == 0 and segmentRectsOverlap(routes, ri, rj, PHYS_TOL))
+                        uf.union_(@intCast(ri), @intCast(rj));
+                    if (d == 1 and segmentViaConnect(routes, ri, rj, PHYS_TOL))
+                        uf.union_(@intCast(ri), @intCast(rj));
+                }
+            }
+            for (0..n_pins) |pi| {
+                const dev_id = ctx.pins.device[pi].toInt();
+                const px = ctx.devices.positions[dev_id][0] + ctx.pins.position[pi][0];
+                const py = ctx.devices.positions[dev_id][1] + ctx.pins.position[pi][1];
+                const pin_node: u32 = @intCast(num_routes + pi);
+                for (0..num_routes) |ri| {
+                    if (routes.layer[ri] > 1) continue;
+                    const hw = routes.width[ri] * 0.5 + PHYS_TOL;
+                    if (pointNearSegment(px, py, routes.x1[ri], routes.y1[ri],
+                                        routes.x2[ri], routes.y2[ri], hw))
+                        uf.union_(pin_node, @intCast(ri));
+                }
+            }
+            const buf = ctx.allocator.alloc(u32, n_pins) catch return -2;
+            for (0..n_pins) |pi| buf[pi] = uf.find(@intCast(num_routes + pi));
+            ctx.layout_connectivity = buf;
+            break :blk buf;
+        } else {
+            // No routes — each pin is its own isolated component.
+            const buf = ctx.allocator.alloc(u32, n_pins) catch return -2;
+            for (buf, 0..) |*b, i| b.* = @intCast(i);
+            ctx.layout_connectivity = buf;
+            break :blk buf;
+        }
+    };
+
+    // ── 2. Determine canonical net name per physical component ────────────────
+    const sc0 = pr.subcircuits[0];
+    var port_set = std.StringHashMap(void).init(ctx.allocator);
+    defer port_set.deinit();
+    for (sc0.ports) |p| port_set.put(p, {}) catch {};
+
+    // comp_name: component_root → best net name (prefer ports).
+    var comp_name = std.AutoHashMap(u32, []const u8).init(ctx.allocator);
+    defer comp_name.deinit();
+    for (0..n_pins) |pi| {
+        const comp_root = conn[pi];
+        const net_idx = ctx.pins.net[pi].toInt();
+        if (net_idx >= n_nets) continue;
+        const net_name = pr.nets[net_idx].name;
+        if (net_name.len == 0) continue;
+        const gop = comp_name.getOrPut(comp_root) catch continue;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = net_name;
+        } else if (!port_set.contains(gop.value_ptr.*) and port_set.contains(net_name)) {
+            gop.value_ptr.* = net_name; // upgrade to port name
+        }
+    }
+
+    // ── 3. Build layout_net_names[net_idx] using physical net names ───────────
+    const layout_net_names = ctx.allocator.alloc([]const u8, n_nets) catch return -2;
+    defer ctx.allocator.free(layout_net_names);
+    for (pr.nets, 0..) |net, i| layout_net_names[i] = net.name; // schematic fallback
+    for (0..n_pins) |pi| {
+        const net_idx = ctx.pins.net[pi].toInt();
+        if (net_idx >= n_nets) continue;
+        if (comp_name.get(conn[pi])) |cn| layout_net_names[net_idx] = cn;
+    }
+
+    // ── 4. Write layout SPICE ────────────────────────────────────────────────
+    const path = out_path_ptr[0..out_path_len];
+    var out_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer out_buf.deinit(ctx.allocator);
+    const writer = out_buf.writer(ctx.allocator);
+    writer.print("* Layout netlist extracted from Spout route connectivity\n", .{}) catch return -2;
+    for (pr.globals) |g| writer.print(".global {s}\n", .{g}) catch return -2;
+    for (pr.subcircuits) |sc| {
+        writeSubcircuitFromPR(writer, sc, pr.devices, pr.pins, layout_net_names) catch return -5;
+    }
+    writer.print(".end\n", .{}) catch return -2;
+    const file = std.fs.cwd().createFile(path, .{}) catch return -4;
+    defer file.close();
+    file.writeAll(out_buf.items) catch return -4;
+    return 0;
+}
+
 /// Run in-engine PEX on the current route segments using SKY130 coefficients.
 /// Returns 0 on success, -1 invalid handle, -2 no routes, -3 OOM.
 export fn spout_run_pex(handle: *anyopaque) i32 {
@@ -2583,6 +2840,7 @@ export fn spout_export_gdsii_with_template(
         if (ctx.routes) |*r| r else null;
 
     // Build net-name slice from parse result for TEXT labels.
+    // Only label PORT nets — internal nets must not get pin-layer labels.
     var net_name_buf: ?[]const []const u8 = null;
     defer if (net_name_buf) |buf| ctx.allocator.free(buf);
 
@@ -2590,7 +2848,17 @@ export fn spout_export_gdsii_with_template(
         if (pr.nets.len > 0) {
             const names = ctx.allocator.alloc([]const u8, pr.nets.len) catch null;
             if (names) |ns| {
-                for (pr.nets, 0..) |net, i| ns[i] = net.name;
+                for (ns) |*n| n.* = "";
+                if (pr.subcircuits.len > 0) {
+                    for (pr.subcircuits[0].ports) |port_name| {
+                        if (pr.net_table.get(port_name)) |nidx| {
+                            const ni = nidx.toInt();
+                            if (ni < ns.len) ns[ni] = pr.nets[ni].name;
+                        }
+                    }
+                } else {
+                    for (pr.nets, 0..) |net, i| ns[i] = net.name;
+                }
                 net_name_buf = ns;
             }
         }

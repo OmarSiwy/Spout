@@ -47,13 +47,15 @@ pub const MoveType = enum {
 // ─── SA configuration ───────────────────────────────────────────────────────
 
 pub const SaConfig = extern struct {
+    // Fields 1-25: exact C-ABI mirror of Python _SaConfigC (python/config.py).
+    // Order and types MUST match _SaConfigC field-for-field.
     initial_temp: f32 = 1000.0,
     cooling_rate: f32 = 0.9995,
     min_temp: f32 = 0.01,
     /// Kept for C-ABI compatibility. Ignored when `kappa > 0`.
     max_iterations: u32 = 50000,
     /// Perturbation range override for translate moves.
-    /// 0.0 → use adaptive ρ(T).  Non-zero → pin to this value.
+    /// 0.0 -> use adaptive rho(T).  Non-zero -> pin to this value.
     perturbation_range: f32 = 0.0,
     w_hpwl: f32 = 1.0,
     w_area: f32 = 0.5,
@@ -61,15 +63,41 @@ pub const SaConfig = extern struct {
     w_matching: f32 = 1.5,
     w_rudy: f32 = 0.3,
     w_overlap: f32 = 100.0,
-    // ── New fields — appended at the END to preserve C-ABI layout ──────
+    /// Thermal symmetry weight (Phase 5) -- field 12 in Python _SaConfigC.
+    w_thermal: f32 = 0.5,
+    /// Timing weight -- field 13 in Python _SaConfigC (reserved; unused in engine).
+    w_timing: f32 = 0.0,
+    /// Embedding similarity weight -- field 14 in Python _SaConfigC.
+    w_embed_similarity: f32 = 0.0,
+    /// Parasitic routing balance weight -- field 15 in Python _SaConfigC.
+    w_parasitic: f32 = 0.8,
+    /// Adaptive cooling flag -- field 16 in Python _SaConfigC (u8: 1=true, 0=false).
+    adaptive_cooling: u8 = 1,
+    _adaptive_pad: [3]u8 = .{ 0, 0, 0 }, // pad so next u32 is 4-byte aligned
+    /// Adaptive cooling acceptance window -- field 17 in Python _SaConfigC.
+    adaptive_window: u32 = 500,
+    /// Maximum number of reheats -- field 18 in Python _SaConfigC.
+    max_reheats: u32 = 5,
+    /// Temperature fraction to reheat to -- field 19 in Python _SaConfigC.
+    reheat_fraction: f32 = 0.3,
+    /// Stall windows before triggering a reheat -- field 20 in Python _SaConfigC.
+    stall_windows_before_reheat: u32 = 3,
+    /// Number of multi-start runs -- field 21 in Python _SaConfigC.
+    num_starts: u32 = 1,
+    /// Delay estimator: driver output resistance (ohms) -- field 22.
+    delay_driver_r: f32 = 500.0,
+    /// Delay estimator: wire resistance per micron (ohms/um) -- field 23.
+    delay_wire_r_per_um: f32 = 0.125,
+    /// Delay estimator: wire capacitance per micron (fF/um) -- field 24.
+    delay_wire_c_per_um: f32 = 0.2,
+    /// Delay estimator: pin input capacitance (fF) -- field 25.
+    delay_pin_c: f32 = 1.0,
+    // Zig-only fields below -- not present in Python _SaConfigC ABI.
     /// Probability of choosing a swap move over a translate.
     p_swap: f32 = 0.65,
     /// Moves per device per temperature level.
-    /// When > 0, uses two-level kappa·N schedule instead of flat max_iterations.
+    /// When > 0, uses two-level kappa*N schedule instead of flat max_iterations.
     kappa: f32 = 20.0,
-    /// Maximum number of reheats (acceptance-ratio triggered).
-    max_reheats: u32 = 5,
-    // ── Hierarchical macro placement fields ─────────────────────────────
     /// Probability of picking a macro_translate move (0 = disabled).
     p_macro_translate: f32 = 0.0,
     /// Probability of picking a macro_transform move (0 = disabled).
@@ -77,37 +105,26 @@ pub const SaConfig = extern struct {
     /// Phase 1b re-optimization trigger: run if unit-cell HPWL / top-level HPWL
     /// exceeds this ratio after phase 2. 0.0 = always skip phase 1b.
     hpwl_ratio_phase1b: f32 = 0.3,
-    // ── Proximity / isolation constraint weights ─────────────────────────
+    /// Proximity constraint weight.
     w_proximity: f32 = 1.0,
+    /// Isolation constraint weight.
     w_isolation: f32 = 1.0,
-    // ── Thermal symmetry weight (Phase 5) ───────────────────────────────
-    w_thermal: f32 = 0.5,
-    // ── Orientation (Phase 2) ─────────────────────────────────────────────
     /// Probability of choosing an orientation flip move.
     p_orientation_flip: f32 = 0.05,
     /// Weight for orientation mismatch cost term.
     w_orientation: f32 = 2.0,
-    // ── LDE (Phase 4) ────────────────────────────────────────────────────
     /// Weight for LDE (SA/SB equalization) cost term.
     w_lde: f32 = 0.5,
-    // ── Common-centroid (Phase 3) ────────────────────────────────────────
     /// Weight for common-centroid cost term.
     w_common_centroid: f32 = 2.0,
     /// Probability of choosing a group_translate move (0 = disabled).
     p_group_translate: f32 = 0.0,
-    // ── Parasitic routing balance (Phase 8) ──────────────────────────────
-    /// Weight for parasitic routing balance cost term.
-    w_parasitic: f32 = 0.8,
-    // ── Interdigitation (Phase 7) ────────────────────────────────────────
     /// Weight for interdigitation cost term.
     w_interdigitation: f32 = 2.0,
-    // ── Edge penalty (Phase 6) ────────────────────────────────────────────
     /// Weight for edge penalty cost term (dummy device modeling).
     w_edge_penalty: f32 = 0.5,
-    // ── WPE (Phase 9) ─────────────────────────────────────────────────────
     /// Weight for WPE (Well Proximity Effect) mismatch cost term.
     w_wpe: f32 = 0.5,
-    // ── Template bounds (Phase 3) ─────────────────────────────────────────
     /// Template/user-area hard placement bounds. All devices must stay within.
     template_x_min: f32 = 0.0,
     template_y_min: f32 = 0.0,

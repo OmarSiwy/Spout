@@ -60,12 +60,15 @@ pub fn extractConstraints(
                 next_gid += 1;
                 // Record seed pair in seen set.
                 try seen.put(patterns.packPair(i, j), {});
+                // Initialize axis to the X-coordinate centroid of the two devices.
+                // This avoids NaN in computeSymmetry for any initial positions.
+                const axis_x = (devices.positions[i][0] + devices.positions[j][0]) * 0.5;
                 try result.append(
                     .symmetry,
                     d_a,
                     d_b,
                     1.0,
-                    std.math.nan(f32), // axis unknown until placement
+                    axis_x,
                     gid,
                 );
                 // Traverse load and cascode pairs attached to the drain nets.
@@ -83,10 +86,10 @@ pub fn extractConstraints(
                 const mirror_key = patterns.packPair(i, j);
                 if (!seen.contains(mirror_key)) {
                     if (isCurrentMirror1to1(devices, pins, adj, d_a, d_b)) {
-                        try result.append(.matching, d_a, d_b, 0.8, std.math.nan(f32), 0);
+                        try result.append(.matching, d_a, d_b, 0.8, 0.0, 0);
                         try seen.put(mirror_key, {});
                     } else if (isCurrentMirrorRatio(devices, pins, adj, d_a, d_b)) {
-                        try result.append(.matching, d_a, d_b, 0.7, std.math.nan(f32), 0);
+                        try result.append(.matching, d_a, d_b, 0.7, 0.0, 0);
                         try seen.put(mirror_key, {});
                     }
                 }
@@ -96,7 +99,7 @@ pub fn extractConstraints(
             if (checkPassivePair(devices, d_a, d_b)) |w| {
                 const key = patterns.packPair(i, j);
                 if (!seen.contains(key)) {
-                    try result.append(.matching, d_a, d_b, w, std.math.nan(f32), 0);
+                    try result.append(.matching, d_a, d_b, w, 0.0, 0);
                     try seen.put(key, {});
                 }
             }
@@ -108,7 +111,7 @@ pub fn extractConstraints(
                     d_a,
                     d_b,
                     0.5,
-                    std.math.nan(f32),
+                    0.0,
                     0,
                 );
             } else if (isCascode(pins, adj, d_b, d_a)) {
@@ -118,14 +121,246 @@ pub fn extractConstraints(
                     d_b,
                     d_a,
                     0.5,
-                    std.math.nan(f32),
+                    0.0,
                     0,
                 );
+            }
+
+            // --- isolation ---
+            // A power device (large NMOS/PMOS or power transistor) near a
+            // noise-sensitive device (small MOSFET) should be isolated.
+            // Trigger: one device has effective W >= 4× the other's effective W,
+            // and both are MOSFETs.  This prevents substrate noise coupling.
+            {
+                const iso_key = patterns.packPair(i, j);
+                if (!seen.contains(iso_key) and isPowerNoisePair(devices, pins, adj, d_a, d_b)) {
+                    // Use the smaller device as d_a for the constraint.
+                    const pair = patterns.normalisePair(d_a, d_b);
+                    try result.append(.isolation, pair[0], pair[1], 0.6, 0.0, 0);
+                    try seen.put(iso_key, {});
+                }
+            }
+
+            // --- symmetry_y ---
+            // Y-axis symmetry: same type, same W/L, different drain nets,
+            // sources connect to the same non-rail net.
+            // Triggers for horizontally mirrored topologies (e.g., cross-coupled pair).
+            {
+                const sy_key = patterns.packPair(i, j);
+                if (!seen.contains(sy_key) and isSymmetryYPair(devices, nets, pins, adj, d_a, d_b)) {
+                    const gid = next_gid;
+                    next_gid += 1;
+                    const pair = patterns.normalisePair(d_a, d_b);
+                    const axis_y = (devices.positions[i][1] + devices.positions[j][1]) * 0.5;
+                    try result.append(.symmetry_y, pair[0], pair[1], 0.9, axis_y, gid);
+                    try seen.put(sy_key, {});
+                }
+            }
+
+            // --- orientation_match ---
+            // Devices in a matching group should have identical orientation.
+            // Trigger: an existing matching constraint exists between (i,j) AND
+            // both are passive (resistor/capacitor).  Emit orientation_match
+            // alongside the matching constraint to lock orientation.
+            {
+                const om_key = patterns.packPair(i, j);
+                if (!seen.contains(om_key)) {
+                    if (checkPassiveOrientationPair(devices, d_a, d_b)) {
+                        const pair = patterns.normalisePair(d_a, d_b);
+                        try result.append(.orientation_match, pair[0], pair[1], 0.5, 0.0, 0);
+                        // Do NOT add to seen — orientation_match is supplemental.
+                    }
+                }
+            }
+
+            // --- common_centroid ---
+            // Identical unit capacitors or resistors in a group of ≥ 3 form a
+            // common-centroid array when they all share the same net pattern.
+            // For pairs: emit common_centroid when both share a net on one terminal
+            // and match in value.  The group_id links them as a set.
+            {
+                const cc_key = patterns.packPair(i, j);
+                if (!seen.contains(cc_key)) {
+                    if (checkCommonCentroidPair(devices, pins, adj, d_a, d_b)) |gid_seed| {
+                        const pair = patterns.normalisePair(d_a, d_b);
+                        const gid = if (gid_seed == 0) blk: {
+                            const g = next_gid;
+                            next_gid += 1;
+                            break :blk g;
+                        } else gid_seed;
+                        try result.append(.common_centroid, pair[0], pair[1], 0.8, 0.0, gid);
+                        try seen.put(cc_key, {});
+                    }
+                }
+            }
+
+            // --- interdigitation ---
+            // Resistor arrays or cap arrays with ≥ 3 elements in the same group
+            // benefit from interdigitation.  Trigger: same type and value as
+            // common_centroid, but terminal nets differ (non-trivial routing).
+            {
+                const id_key = patterns.packPair(i, j);
+                if (!seen.contains(id_key)) {
+                    if (checkInterdigitationPair(devices, pins, adj, d_a, d_b)) |gid_seed| {
+                        const pair = patterns.normalisePair(d_a, d_b);
+                        const gid = if (gid_seed == 0) blk: {
+                            const g = next_gid;
+                            next_gid += 1;
+                            break :blk g;
+                        } else gid_seed;
+                        try result.append(.interdigitation, pair[0], pair[1], 0.7, 0.0, gid);
+                        try seen.put(id_key, {});
+                    }
+                }
             }
         }
     }
 
     return result;
+}
+
+// ─── New predicate helpers ─────────────────────────────────────────────────
+
+/// Power-noise pair: one MOSFET has W ≥ 4× the other, suggesting a large
+/// power device adjacent to a small signal device.  Isolation keeps them apart.
+/// Requires the devices share at least one net (source, drain, or gate) —
+/// isolated devices with no topological connection need no isolation constraint.
+fn isPowerNoisePair(
+    devices: *const DeviceArrays,
+    pins: *const PinEdgeArrays,
+    adj: *const FlatAdjList,
+    d_a: DeviceIdx,
+    d_b: DeviceIdx,
+) bool {
+    const ia: usize = d_a.toInt();
+    const ib: usize = d_b.toInt();
+    const ta = devices.types[ia];
+    const tb = devices.types[ib];
+    if ((ta != .nmos and ta != .pmos) or (tb != .nmos and tb != .pmos)) return false;
+    const wa = patterns.effectiveW(devices, d_a);
+    const wb = patterns.effectiveW(devices, d_b);
+    if (wa <= 0.0 or wb <= 0.0) return false;
+    const ratio = if (wa >= wb) wa / wb else wb / wa;
+    if (ratio < 4.0) return false;
+    // Only isolate when the devices share at least one net (source/drain/gate).
+    const terminals_a = [3]?NetIdx{
+        patterns.sourceNet(adj, pins, d_a),
+        patterns.drainNet(adj, pins, d_a),
+        patterns.gateNet(adj, pins, d_a),
+    };
+    const terminals_b = [3]?NetIdx{
+        patterns.sourceNet(adj, pins, d_b),
+        patterns.drainNet(adj, pins, d_b),
+        patterns.gateNet(adj, pins, d_b),
+    };
+    for (terminals_a) |na_opt| {
+        const na = na_opt orelse continue;
+        for (terminals_b) |nb_opt| {
+            const nb = nb_opt orelse continue;
+            if (na.toInt() == nb.toInt()) return true;
+        }
+    }
+    return false;
+}
+
+/// Y-axis symmetry pair: same type, same W/L, shared source net (non-rail),
+/// but sources connect to same node and drain nets differ.
+/// This is the horizontal mirror complement of isSeedPair (which checks X symmetry).
+fn isSymmetryYPair(
+    devices: *const DeviceArrays,
+    nets: *const NetArrays,
+    pins: *const PinEdgeArrays,
+    adj: *const FlatAdjList,
+    d_a: DeviceIdx,
+    d_b: DeviceIdx,
+) bool {
+    const ia: usize = d_a.toInt();
+    const ib: usize = d_b.toInt();
+    if (devices.types[ia] != .nmos and devices.types[ia] != .pmos) return false;
+    if (devices.types[ia] != devices.types[ib]) return false;
+    if (!patterns.approxEq(patterns.effectiveW(devices, d_a), patterns.effectiveW(devices, d_b))) return false;
+    if (!patterns.approxEq(devices.params[ia].l, devices.params[ib].l)) return false;
+    // Drain nets must differ (otherwise it's a wire short, not a mirror).
+    const drain_a = patterns.drainNet(adj, pins, d_a) orelse return false;
+    const drain_b = patterns.drainNet(adj, pins, d_b) orelse return false;
+    if (drain_a.toInt() == drain_b.toInt()) return false;
+    // Gate nets must differ (different inputs in a Y-symmetric topology).
+    const gate_a = patterns.gateNet(adj, pins, d_a) orelse return false;
+    const gate_b = patterns.gateNet(adj, pins, d_b) orelse return false;
+    if (gate_a.toInt() == gate_b.toInt()) return false;
+    // Sources must connect to the same non-rail node.
+    const src_a = patterns.sourceNet(adj, pins, d_a) orelse return false;
+    const src_b = patterns.sourceNet(adj, pins, d_b) orelse return false;
+    if (src_a.toInt() != src_b.toInt()) return false;
+    if (patterns.isRail(src_a, nets)) return false;
+    return true;
+}
+
+/// Passive orientation pair: same passive type and same value; emit
+/// orientation_match so the placer keeps them pointing the same direction.
+fn checkPassiveOrientationPair(devices: *const DeviceArrays, d_a: DeviceIdx, d_b: DeviceIdx) bool {
+    const ia: usize = d_a.toInt();
+    const ib: usize = d_b.toInt();
+    if (devices.types[ia] != devices.types[ib]) return false;
+    switch (devices.types[ia]) {
+        .res, .res_poly, .res_diff_n, .res_diff_p, .res_well_n, .res_well_p, .res_metal,
+        .cap, .cap_mim, .cap_mom, .cap_pip, .cap_gate => {},
+        else => return false,
+    }
+    return patterns.approxEq(devices.params[ia].value, devices.params[ib].value);
+}
+
+/// Common-centroid pair: both devices are identical unit passives (cap or res)
+/// that share one terminal net.  Sharing a terminal implies they form an array.
+/// Returns a non-zero seed group_id if a common terminal is detected, else null.
+fn checkCommonCentroidPair(
+    devices: *const DeviceArrays,
+    pins: *const PinEdgeArrays,
+    adj: *const FlatAdjList,
+    d_a: DeviceIdx,
+    d_b: DeviceIdx,
+) ?u32 {
+    const ia: usize = d_a.toInt();
+    const ib: usize = d_b.toInt();
+    if (devices.types[ia] != devices.types[ib]) return null;
+    switch (devices.types[ia]) {
+        .cap, .cap_mim, .cap_mom, .cap_pip, .cap_gate => {},
+        else => return null,
+    }
+    if (!patterns.approxEq(devices.params[ia].value, devices.params[ib].value)) return null;
+    // Check if drain nets are the same (shared top-plate → common centroid).
+    const drain_a = patterns.drainNet(adj, pins, d_a) orelse return null;
+    const drain_b = patterns.drainNet(adj, pins, d_b) orelse return null;
+    if (drain_a.toInt() != drain_b.toInt()) return null;
+    return 1; // non-zero seed; caller assigns the real gid
+}
+
+/// Interdigitation pair: identical resistors whose terminal nets differ on
+/// both ends (true differential connection → needs interdigitation to cancel
+/// gradient effects).
+fn checkInterdigitationPair(
+    devices: *const DeviceArrays,
+    pins: *const PinEdgeArrays,
+    adj: *const FlatAdjList,
+    d_a: DeviceIdx,
+    d_b: DeviceIdx,
+) ?u32 {
+    const ia: usize = d_a.toInt();
+    const ib: usize = d_b.toInt();
+    if (devices.types[ia] != devices.types[ib]) return null;
+    switch (devices.types[ia]) {
+        .res, .res_poly, .res_diff_n, .res_diff_p, .res_well_n, .res_well_p, .res_metal => {},
+        else => return null,
+    }
+    if (!patterns.approxEq(devices.params[ia].value, devices.params[ib].value)) return null;
+    // Both terminal nets must be distinct on each device (fully differential).
+    const drain_a = patterns.drainNet(adj, pins, d_a) orelse return null;
+    const drain_b = patterns.drainNet(adj, pins, d_b) orelse return null;
+    const src_a = patterns.sourceNet(adj, pins, d_a) orelse return null;
+    const src_b = patterns.sourceNet(adj, pins, d_b) orelse return null;
+    // At least one terminal net must differ between the two resistors.
+    if (drain_a.toInt() == drain_b.toInt() and src_a.toInt() == src_b.toInt()) return null;
+    return 1; // non-zero seed; caller assigns the real gid
 }
 
 // ─── Load-pair / cascode-pair traversal ─────────────────────────────────────
@@ -171,7 +406,8 @@ fn findLoadPair(
             const pair = patterns.normalisePair(d_x, d_y);
             const key = patterns.packPair(pair[0].toInt(), pair[1].toInt());
             if (seen.contains(key)) continue;
-            try result.append(.symmetry, pair[0], pair[1], 1.0, std.math.nan(f32), group_id);
+            const load_axis = (devices.positions[ix][0] + devices.positions[iy][0]) * 0.5;
+            try result.append(.symmetry, pair[0], pair[1], 1.0, load_axis, group_id);
             try seen.put(key, {});
         }
     }
@@ -211,7 +447,8 @@ fn findTailBias(
         // Self-symmetric: device_a == device_b.
         const key = patterns.packPair(i, i);
         if (seen.contains(key)) continue;
-        try result.append(.symmetry, d, d, 0.5, std.math.nan(f32), group_id);
+        // Axis is the device's own X position (it lies on the axis of symmetry).
+        try result.append(.symmetry, d, d, 0.5, devices.positions[i][0], group_id);
         try seen.put(key, {});
     }
 }
@@ -250,7 +487,7 @@ fn findCascodePair(
             const pair = patterns.normalisePair(d_x, d_y);
             const key = patterns.packPair(pair[0].toInt(), pair[1].toInt());
             if (seen.contains(key)) continue;
-            try result.append(.proximity, pair[0], pair[1], 0.5, std.math.nan(f32), group_id);
+            try result.append(.proximity, pair[0], pair[1], 0.5, 0.0, group_id);
             try seen.put(key, {});
         }
     }
@@ -472,7 +709,7 @@ pub fn addConstraintsFromML(
                 constraints.group_id[idx] = shifted_gid;
             }
         } else {
-            try constraints.append(ctype, a, b, weight, std.math.nan(f32), shifted_gid);
+            try constraints.append(ctype, a, b, weight, 0.0, shifted_gid);
             const new_idx: usize = @intCast(constraints.len - 1);
             try existing.put(key, new_idx);
         }

@@ -26,6 +26,15 @@ const NetIdx = types.NetIdx;
 // are 0-indexed from M1, subtract 1 from the route layer index for metal
 // layers (i.e. pdk.min_width[route_layer - 1] for route_layer >= 1).
 
+/// Segment-level routing flags (mirrors AnalogSegmentDB.SegmentFlags).
+/// Stored separately so the core route_arrays.zig has no analog router dependency.
+pub const RouteSegmentFlags = packed struct(u8) {
+    is_shield: bool = false,
+    is_dummy_via: bool = false,
+    is_jog: bool = false,
+    _padding: u5 = 0,
+};
+
 pub const RouteArrays = struct {
     /// Metal/interconnect layer index (see convention comment above).
     layer: []u8,
@@ -35,6 +44,8 @@ pub const RouteArrays = struct {
     y2: []f32,
     width: []f32,
     net: []NetIdx,
+    /// Segment flags (is_shield, is_dummy_via, is_jog) from analog routing.
+    flags: []RouteSegmentFlags,
     allocator: std.mem.Allocator,
     len: u32,
     capacity: u32,
@@ -70,6 +81,10 @@ pub const RouteArrays = struct {
         errdefer allocator.free(nets);
         @memset(nets, NetIdx.fromInt(0));
 
+        const fl = try allocator.alloc(RouteSegmentFlags, n);
+        errdefer allocator.free(fl);
+        @memset(fl, RouteSegmentFlags{});
+
         return RouteArrays{
             .layer = lay,
             .x1 = rx1,
@@ -78,14 +93,46 @@ pub const RouteArrays = struct {
             .y2 = ry2,
             .width = w,
             .net = nets,
+            .flags = fl,
             .allocator = allocator,
             .len = count,
             .capacity = count,
         };
     }
 
+    /// Ensure there is room for at least `additional` more elements beyond current len.
+    pub fn ensureUnusedCapacity(self: *RouteArrays, _: std.mem.Allocator, additional: u32) !void {
+        const needed = self.len + additional;
+        if (needed > self.capacity) {
+            try self.growTo(needed);
+        }
+    }
+
+    /// Append a single route segment without bounds checking.
+    /// Caller must ensure capacity via ensureUnusedCapacity first.
+    pub fn appendAssumeCapacity(
+        self: *RouteArrays,
+        seg_layer: u8,
+        seg_x1: f32,
+        seg_y1: f32,
+        seg_x2: f32,
+        seg_y2: f32,
+        seg_width: f32,
+        seg_net: NetIdx,
+    ) void {
+        const i: usize = @intCast(self.len);
+        self.layer[i] = seg_layer;
+        self.x1[i] = seg_x1;
+        self.y1[i] = seg_y1;
+        self.x2[i] = seg_x2;
+        self.y2[i] = seg_y2;
+        self.width[i] = seg_width;
+        self.net[i] = seg_net;
+        self.len += 1;
+    }
+
     /// Grow all arrays to accommodate at least `new_cap` elements.
-    fn growTo(self: *RouteArrays, new_cap: u32) !void {
+    pub fn growTo(self: *RouteArrays, new_cap: u32) !void {
         const nc: usize = @intCast(new_cap);
 
         self.layer = try self.allocator.realloc(self.layer, nc);
@@ -95,6 +142,7 @@ pub const RouteArrays = struct {
         self.y2 = try self.allocator.realloc(self.y2, nc);
         self.width = try self.allocator.realloc(self.width, nc);
         self.net = try self.allocator.realloc(self.net, nc);
+        self.flags = try self.allocator.realloc(self.flags, nc);
 
         self.capacity = new_cap;
     }
@@ -134,6 +182,7 @@ pub const RouteArrays = struct {
             self.allocator.free(self.y2);
             self.allocator.free(self.width);
             self.allocator.free(self.net);
+            self.allocator.free(self.flags);
         }
         self.* = undefined;
     }

@@ -16,11 +16,16 @@ const layout_if = @import("../core/layout_if.zig");
 const device_arrays_mod = @import("../core/device_arrays.zig");
 const route_arrays_mod = @import("../core/route_arrays.zig");
 const pin_edge_arrays_mod = @import("../core/pin_edge_arrays.zig");
+const spatial_grid_mod = @import("spatial_grid.zig");
 
 const NetIdx = core_types.NetIdx;
 const DeviceArrays = device_arrays_mod.DeviceArrays;
 const RouteArrays = route_arrays_mod.RouteArrays;
 const PinEdgeArrays = pin_edge_arrays_mod.PinEdgeArrays;
+const SpatialGrid = spatial_grid_mod.SpatialGrid;
+const SpatialDrcChecker = spatial_grid_mod.SpatialDrcChecker;
+const analog_types_mod = @import("analog_types.zig");
+const AnalogRect = analog_types_mod.Rect;
 
 // Internal alias — InlineDrcChecker uses layout_if.PdkConfig for routing queries.
 const LayoutPdkConfig = layout_if.PdkConfig;
@@ -120,6 +125,18 @@ pub const InlineDrcChecker = struct {
     extent_x: f32,
     extent_y: f32,
 
+    // ── P2-A: Spatial grid for O(1)+k DRC lookups ────────────────────────────
+    // Parallel flat arrays for the spatial checker (kept in sync with segments).
+    // Rebuilt by rebuildSpatialGrid() after segment batches.
+    spatial: ?SpatialGrid,
+    seg_x1_flat: std.ArrayListUnmanaged(f32),
+    seg_y1_flat: std.ArrayListUnmanaged(f32),
+    seg_x2_flat: std.ArrayListUnmanaged(f32),
+    seg_y2_flat: std.ArrayListUnmanaged(f32),
+    seg_width_flat: std.ArrayListUnmanaged(f32),
+    seg_layer_flat: std.ArrayListUnmanaged(u8),
+    seg_net_flat: std.ArrayListUnmanaged(NetIdx),
+
     pub fn init(
         allocator: std.mem.Allocator,
         pdk: *const LayoutPdkConfig,
@@ -137,16 +154,60 @@ pub const InlineDrcChecker = struct {
             .origin_y = origin_y,
             .extent_x = extent_x,
             .extent_y = extent_y,
+            .spatial = null,
+            .seg_x1_flat = .{},
+            .seg_y1_flat = .{},
+            .seg_x2_flat = .{},
+            .seg_y2_flat = .{},
+            .seg_width_flat = .{},
+            .seg_layer_flat = .{},
+            .seg_net_flat = .{},
         };
     }
 
     pub fn deinit(self: *InlineDrcChecker) void {
         self.segments.deinit(self.allocator);
         self.markers.deinit(self.allocator);
+        if (self.spatial) |*sg| sg.deinit();
+        self.seg_x1_flat.deinit(self.allocator);
+        self.seg_y1_flat.deinit(self.allocator);
+        self.seg_x2_flat.deinit(self.allocator);
+        self.seg_y2_flat.deinit(self.allocator);
+        self.seg_width_flat.deinit(self.allocator);
+        self.seg_layer_flat.deinit(self.allocator);
+        self.seg_net_flat.deinit(self.allocator);
+    }
+
+    /// Rebuild the SpatialGrid from current segment data.
+    /// Call after adding a batch of segments (e.g., after routing each net).
+    /// Uses die bbox derived from origin + extent fields.
+    pub fn rebuildSpatialGrid(self: *InlineDrcChecker) !void {
+        const die_bbox = AnalogRect{
+            .x1 = self.origin_x,
+            .y1 = self.origin_y,
+            .x2 = self.origin_x + self.extent_x,
+            .y2 = self.origin_y + self.extent_y,
+        };
+
+        if (self.spatial) |*old| old.deinit();
+        // self.pdk is already *const layout_if.PdkConfig — pass directly.
+        self.spatial = try SpatialGrid.init(self.allocator, die_bbox, self.pdk);
+
+        const n = @as(u32, @intCast(self.seg_x1_flat.items.len));
+        if (n > 0) {
+            try self.spatial.?.rebuild(
+                self.seg_x1_flat.items,
+                self.seg_y1_flat.items,
+                self.seg_x2_flat.items,
+                self.seg_y2_flat.items,
+                n,
+            );
+        }
     }
 
     /// Register a routed wire segment.  The segment is expanded by half-width
     /// on each side to form an axis-aligned bounding box.
+    /// Also appends to parallel flat arrays for SpatialDrcChecker rebuilds.
     pub fn addSegment(
         self: *InlineDrcChecker,
         layer: u8,
@@ -166,6 +227,14 @@ pub const InlineDrcChecker = struct {
             .net = net,
             .layer = layer,
         });
+        // Keep flat parallel arrays in sync for SpatialGrid rebuilds.
+        try self.seg_x1_flat.append(self.allocator, x1);
+        try self.seg_y1_flat.append(self.allocator, y1);
+        try self.seg_x2_flat.append(self.allocator, x2);
+        try self.seg_y2_flat.append(self.allocator, y2);
+        try self.seg_width_flat.append(self.allocator, width);
+        try self.seg_layer_flat.append(self.allocator, layer);
+        try self.seg_net_flat.append(self.allocator, net);
     }
 
     /// Remove all segments belonging to a given net (e.g. before rip-up and reroute).
@@ -184,7 +253,32 @@ pub const InlineDrcChecker = struct {
     /// for a given net.  Returns hard_violation = true if the point (expanded to
     /// min_width) overlaps or is closer than min_spacing to any segment of a
     /// different net on the same layer.
+    ///
+    /// P2-A: Uses SpatialDrcChecker (O(1)+k) when spatial grid is populated;
+    /// falls back to O(n) linear scan otherwise.
     pub fn checkSpacing(self: *const InlineDrcChecker, layer: u8, x: f32, y: f32, net: NetIdx) DrcResult {
+        // Fast path: spatial grid available — use O(1)+k query.
+        if (self.spatial) |*sg| {
+            const n = @as(u32, @intCast(self.seg_x1_flat.items.len));
+            if (n > 0) {
+                const checker = SpatialDrcChecker{
+                    .grid = sg,
+                    .seg_x1 = self.seg_x1_flat.items,
+                    .seg_y1 = self.seg_y1_flat.items,
+                    .seg_x2 = self.seg_x2_flat.items,
+                    .seg_y2 = self.seg_y2_flat.items,
+                    .seg_width = self.seg_width_flat.items,
+                    .seg_layer = self.seg_layer_flat.items,
+                    .seg_net = self.seg_net_flat.items,
+                    .seg_count = n,
+                    .pdk = self.pdk,
+                };
+                const r = checker.checkSpacing(layer, x, y, net);
+                return .{ .hard_violation = r.hard_violation, .soft_penalty = r.soft_penalty };
+            }
+        }
+
+        // Slow path: O(n) linear scan (no spatial grid yet).
         const min_sp = if (layer < 8) self.pdk.min_spacing[layer] else self.pdk.min_spacing[0];
         const min_w = if (layer < 8) self.pdk.min_width[layer] else self.pdk.min_width[0];
         const hw = min_w * 0.5;

@@ -43,7 +43,7 @@ if "spout" not in sys.modules:
         spec.loader.exec_module(mod)
 
 from spout.config import SpoutConfig
-from spout.pipeline import PipelineResult, StageTimings, run_pipeline
+from spout.main import PipelineResult, StageTimings, run_pipeline
 
 logging.disable(logging.CRITICAL)  # silence pipeline logger; we render our own output
 

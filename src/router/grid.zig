@@ -395,10 +395,8 @@ pub const MultiLayerGrid = struct {
         const m1_pitch = pdk.metal_pitch[0];
         const keepout = m1_half + pdk.min_spacing[0] + pdk.min_width[0] / 2.0 + m1_pitch * 0.5;
 
-        // Hardcoded pin offsets matching computePinOffsets / gdsii.zig.
-        const sd_contact_y: f32 = 0.13;
+        // Gate contact x-offset: gate_pad_width/2 * db_unit = 0.20 µm (constant).
         const gate_contact_x: f32 = 0.20;
-        const body_tap_y: f32 = 0.70;
 
         // Pass 1: force-block all keepout zones on M1 (layer 0).
         for (0..n_dev) |i| {
@@ -416,11 +414,17 @@ pub const MultiLayerGrid = struct {
             const mult: f32 = @floatFromInt(@max(@as(u16, 1), params.mult));
             const w_scaled = w_base * mult;
 
+            // Effective sd_extension matching effectiveSdExtension(l) in gdsii.zig.
+            const raw_sd: f32 = @max(0.26, 0.39 - l_scaled);
+            const eff_sd_ext_um: f32 = @ceil(raw_sd / 0.002) * 0.002;
+            const sd_contact_y: f32 = eff_sd_ext_um * 0.5;
+            const body_tap_y: f32 = eff_sd_ext_um + 0.44;
+
             const terminals = [_]struct { ox: f32, oy: f32 }{
                 .{ .ox = w_scaled * 0.5, .oy = -sd_contact_y },
                 .{ .ox = w_scaled * 0.5, .oy = l_scaled + sd_contact_y },
                 .{ .ox = -gate_contact_x, .oy = l_scaled * 0.5 },
-                .{ .ox = w_scaled * 0.5, .oy = -body_tap_y },
+                .{ .ox = 0.0, .oy = -body_tap_y },
             };
 
             for (terminals) |term| {
@@ -446,12 +450,18 @@ pub const MultiLayerGrid = struct {
             const mult_f: f32 = @floatFromInt(@max(@as(u16, 1), params.mult));
             const w_scaled = w_base * mult_f;
 
+            // Effective sd_extension (per-device, matches gdsii.zig).
+            const raw_sd_p2: f32 = @max(0.26, 0.39 - l_scaled);
+            const eff_sd_ext_um_p2: f32 = @ceil(raw_sd_p2 / 0.002) * 0.002;
+            const sd_contact_y: f32 = eff_sd_ext_um_p2 * 0.5;
+            const body_tap_y: f32 = eff_sd_ext_um_p2 + 0.44;
+
             const idx: u32 = @intCast(i);
             const term_defs = [_]struct { t: TerminalType, ox: f32, oy: f32 }{
                 .{ .t = .source, .ox = w_scaled * 0.5, .oy = -sd_contact_y },
                 .{ .t = .drain, .ox = w_scaled * 0.5, .oy = l_scaled + sd_contact_y },
                 .{ .t = .gate, .ox = -gate_contact_x, .oy = l_scaled * 0.5 },
-                .{ .t = .body, .ox = w_scaled * 0.5, .oy = -body_tap_y },
+                .{ .t = .body, .ox = 0.0, .oy = -body_tap_y },
             };
 
             for (term_defs) |term| {
@@ -459,10 +469,27 @@ pub const MultiLayerGrid = struct {
                 if (net_id) |nid| {
                     const abs_x = px + term.ox;
                     const abs_y = py + term.oy;
-                    const node = self.worldToNode(0, abs_x, abs_y);
-                    const cell = self.cellAt(node);
-                    cell.state = .net_owned;
-                    cell.net_owner = NetIdx.fromInt(@intCast(nid));
+                    // Un-block the full keepout rectangle for this net so A* can
+                    // traverse the keepout zone when routing the correct net.
+                    // Only overwrite .blocked cells — leave foreign net_owned cells alone.
+                    const net_idx = NetIdx.fromInt(@intCast(nid));
+                    const nd_min = self.worldToNode(0, abs_x - keepout, abs_y - keepout);
+                    const nd_max = self.worldToNode(0, abs_x + keepout, abs_y + keepout);
+                    const a_lo = @min(nd_min.track_a, nd_max.track_a);
+                    const a_hi = @max(nd_min.track_a, nd_max.track_a);
+                    const b_lo = @min(nd_min.track_b, nd_max.track_b);
+                    const b_hi = @max(nd_min.track_b, nd_max.track_b);
+                    var a: u32 = a_lo;
+                    while (a <= a_hi) : (a += 1) {
+                        var b: u32 = b_lo;
+                        while (b <= b_hi) : (b += 1) {
+                            const c = self.cellAt(.{ .layer = 0, .track_a = a, .track_b = b });
+                            if (c.state == .blocked) {
+                                c.state = .net_owned;
+                                c.net_owner = net_idx;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -649,7 +676,7 @@ pub const RoutingGrid = struct {
                 .{ .ox = w_scaled * 0.5, .oy = -sd_contact_y },
                 .{ .ox = w_scaled * 0.5, .oy = l_scaled + sd_contact_y },
                 .{ .ox = -gate_contact_x, .oy = l_scaled * 0.5 },
-                .{ .ox = w_scaled * 0.5, .oy = -body_tap_y },
+                .{ .ox = 0.0, .oy = -body_tap_y },
             };
             for (terminals) |term| {
                 const abs_x = px + term.ox;
@@ -685,18 +712,31 @@ pub const RoutingGrid = struct {
                 .{ .t = .source, .ox = w_scaled * 0.5, .oy = -sd_contact_y },
                 .{ .t = .drain, .ox = w_scaled * 0.5, .oy = l_scaled + sd_contact_y },
                 .{ .t = .gate, .ox = -gate_contact_x, .oy = l_scaled * 0.5 },
-                .{ .t = .body, .ox = w_scaled * 0.5, .oy = -body_tap_y },
+                .{ .t = .body, .ox = 0.0, .oy = -body_tap_y },
             };
             for (term_defs) |term| {
                 const net_id: ?u32 = if (pins) |pd| pinNetForTerminal(pd, idx, term.t) else null;
                 if (net_id) |nid| {
                     const abs_x = px + term.ox;
                     const abs_y = py + term.oy;
-                    const pc = self.worldToCol(abs_x);
-                    const pr = self.worldToRow(abs_y);
-                    const cell = self.cellAt(0, pr, pc);
-                    cell.state = .net_owned;
-                    cell.net_owner = NetIdx.fromInt(@intCast(nid));
+                    // Un-block full keepout rectangle for this net so A* can
+                    // traverse the keepout zone when routing the correct net.
+                    const net_idx = NetIdx.fromInt(@intCast(nid));
+                    const c_lo = self.worldToCol(abs_x - keepout);
+                    const c_hi = self.worldToCol(abs_x + keepout);
+                    const r_lo = self.worldToRow(abs_y - keepout);
+                    const r_hi = self.worldToRow(abs_y + keepout);
+                    var r: u32 = r_lo;
+                    while (r <= r_hi) : (r += 1) {
+                        var c: u32 = c_lo;
+                        while (c <= c_hi) : (c += 1) {
+                            const cell = self.cellAt(0, r, c);
+                            if (cell.state == .blocked) {
+                                cell.state = .net_owned;
+                                cell.net_owner = net_idx;
+                            }
+                        }
+                    }
                 }
             }
         }

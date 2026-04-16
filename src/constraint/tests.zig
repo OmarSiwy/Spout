@@ -694,6 +694,10 @@ test "symmetry weight is 1.0, matching is 0.8, proximity is 0.5" {
             .matching => try std.testing.expectEqual(@as(f32, 0.8), result.weight[i]),
             .proximity => try std.testing.expectEqual(@as(f32, 0.5), result.weight[i]),
             .isolation => {},
+            .symmetry_y => {},
+            .orientation_match => {},
+            .common_centroid => {},
+            .interdigitation => {},
         }
     }
 

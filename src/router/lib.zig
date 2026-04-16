@@ -206,4 +206,7 @@ test {
     _ = @import("pex_feedback.zig");
     _ = @import("thread_pool.zig");
     _ = @import("parallel_router.zig");
+    _ = @import("analog_tests.zig");
+    _ = @import("lde.zig");
+    _ = @import("thermal.zig");
 }

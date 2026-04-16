@@ -275,6 +275,16 @@ pub const MazeRouter = struct {
                 // Direct M2 vertical drop from pin to trunk.
                 try self.routes.append(LAYER_M2,
                     px, raw_py, px, trunk_y, m2w, net_idx);
+
+                // M1 landing pad at the trunk end of the M2 drop.
+                // The GDS writer generates vias at layer transitions
+                // between consecutive segments; without this trailing
+                // M1 segment the last pin's M2 drop would have no via
+                // connecting it to the M1 trunk.
+                try self.routes.append(LAYER_M1,
+                    px - half_m1w, trunk_y,
+                    px + half_m1w, trunk_y,
+                    m1w, net_idx);
             }
         }
     }

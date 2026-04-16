@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="pipe-g" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0C2340"/>
+      <stop offset="100%" stop-color="#1258A0"/>
+    </linearGradient>
+    <linearGradient id="noz-g" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#1258A0"/>
+      <stop offset="100%" stop-color="#0A3A70"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="1.1" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="100" height="100" rx="16" fill="#060C18"/>
+
+  <!-- Subtle grid dots (PCB theme) -->
+  <g fill="#0F1E30" opacity="0.9">
+    <circle cx="10" cy="10" r="0.7"/><circle cx="20" cy="10" r="0.7"/>
+    <circle cx="10" cy="20" r="0.7"/><circle cx="20" cy="20" r="0.7"/>
+    <circle cx="10" cy="90" r="0.7"/><circle cx="20" cy="90" r="0.7"/>
+    <circle cx="10" cy="80" r="0.7"/><circle cx="20" cy="80" r="0.7"/>
+  </g>
+
+  <!-- ── SCHEMATIC (left) ─────────────────────────────── -->
+  <!-- Op-amp triangle -->
+  <polygon points="5,26 5,74 29,50"
+           fill="#070F1E" stroke="#4A8AB0" stroke-width="1.4" stroke-linejoin="round"/>
+
+  <!-- + input wire -->
+  <line x1="2" y1="38" x2="5" y2="38" stroke="#4A8AB0" stroke-width="1.2"/>
+  <!-- − input wire -->
+  <line x1="2" y1="62" x2="5" y2="62" stroke="#4A8AB0" stroke-width="1.2"/>
+
+  <!-- + label -->
+  <text x="9" y="42" font-size="6.5" fill="#4A8AB0" font-family="monospace" font-weight="bold">+</text>
+  <!-- − label -->
+  <text x="9" y="66" font-size="7.5" fill="#4A8AB0" font-family="monospace" font-weight="bold">−</text>
+
+  <!-- Output wire from op-amp to funnel -->
+  <line x1="29" y1="50" x2="34" y2="50" stroke="#4A8AB0" stroke-width="1.2"/>
+
+  <!-- ── PIPE / NOZZLE (centre) ─────────────────────────── -->
+  <!-- Funnel entrance (schematic → pipe) -->
+  <path d="M34,39 L44,43 L44,57 L34,61 Z"
+        fill="url(#pipe-g)" stroke="#1A5080" stroke-width="0.8"/>
+
+  <!-- Pipe body -->
+  <rect x="44" y="43" width="14" height="14" rx="1"
+        fill="url(#pipe-g)" stroke="#1A5080" stroke-width="0.8"/>
+  <!-- Pipe sheen -->
+  <rect x="44" y="43" width="14" height="4" rx="1"
+        fill="#2A80C0" opacity="0.25"/>
+  <!-- Pipe rivet lines -->
+  <line x1="48" y1="43" x2="48" y2="57" stroke="#1A5080" stroke-width="0.5" opacity="0.6"/>
+  <line x1="54" y1="43" x2="54" y2="57" stroke="#1A5080" stroke-width="0.5" opacity="0.6"/>
+
+  <!-- Nozzle (tapered spout) -->
+  <polygon points="58,41 67,45 67,55 58,59"
+           fill="url(#noz-g)" stroke="#1A70B0" stroke-width="0.8"/>
+  <!-- Nozzle sheen -->
+  <polygon points="58,41 67,45 67,47 58,43"
+           fill="#2A90D0" opacity="0.25"/>
+
+  <!-- ── GDS LAYER POLYGONS (right) ────────────────────── -->
+  <!-- Each "stream" = a GDS layer, colored per sky130 convention -->
+  <!-- Spray fans outward: 5 streams, diverging up/down from centre -->
+
+  <!-- STREAM 1 — nwell / deep n-well (pink) — uppermost -->
+  <rect x="70" y="23" width="10" height="4"  rx="0.6" fill="#FF6B9D" opacity="0.90" filter="url(#glow)"/>
+  <rect x="82" y="18" width="8"  height="3"  rx="0.6" fill="#FF6B9D" opacity="0.60"/>
+  <rect x="92" y="13" width="5"  height="2"  rx="0.6" fill="#FF6B9D" opacity="0.30"/>
+
+  <!-- STREAM 2 — poly (red) -->
+  <rect x="70" y="33" width="9"  height="4"  rx="0.6" fill="#EF5350" opacity="0.92" filter="url(#glow)"/>
+  <rect x="81" y="29" width="7"  height="3"  rx="0.6" fill="#EF5350" opacity="0.62"/>
+  <rect x="90" y="26" width="5"  height="2"  rx="0.6" fill="#EF5350" opacity="0.33"/>
+
+  <!-- STREAM 3 — metal1 (blue, centre, widest) -->
+  <rect x="70" y="44" width="11" height="6"  rx="0.6" fill="#1E88E5" opacity="0.96" filter="url(#glow)"/>
+  <rect x="83" y="45" width="9"  height="5"  rx="0.6" fill="#1E88E5" opacity="0.68"/>
+  <rect x="94" y="46" width="5"  height="3"  rx="0.6" fill="#1E88E5" opacity="0.36"/>
+  <!-- Via dot on metal1 -->
+  <circle cx="92" cy="47" r="1.6" fill="#FDD835" opacity="0.85" filter="url(#glow)"/>
+
+  <!-- STREAM 4 — active / diffusion (green) -->
+  <rect x="70" y="57" width="9"  height="4"  rx="0.6" fill="#43A047" opacity="0.92" filter="url(#glow)"/>
+  <rect x="81" y="62" width="7"  height="3"  rx="0.6" fill="#43A047" opacity="0.62"/>
+  <rect x="90" y="67" width="5"  height="2"  rx="0.6" fill="#43A047" opacity="0.33"/>
+
+  <!-- STREAM 5 — local interconnect li1 (amber) — lowermost -->
+  <rect x="70" y="68" width="10" height="4"  rx="0.6" fill="#FB8C00" opacity="0.90" filter="url(#glow)"/>
+  <rect x="82" y="74" width="8"  height="3"  rx="0.6" fill="#FB8C00" opacity="0.60"/>
+  <rect x="92" y="79" width="5"  height="2"  rx="0.6" fill="#FB8C00" opacity="0.30"/>
+</svg>

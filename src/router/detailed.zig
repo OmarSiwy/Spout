@@ -11,6 +11,9 @@ const astar_mod = @import("astar.zig");
 const steiner_mod = @import("steiner.zig");
 const pin_access_mod = @import("pin_access.zig");
 const inline_drc_mod = @import("inline_drc.zig");
+const analog_router_mod = @import("analog_router.zig");
+const analog_groups_mod = @import("analog_groups.zig");
+const analog_types_mod = @import("analog_types.zig");
 
 const NetIdx = core_types.NetIdx;
 const PinIdx = core_types.PinIdx;
@@ -26,6 +29,18 @@ const AStarRouter = astar_mod.AStarRouter;
 const SteinerTree = steiner_mod.SteinerTree;
 const PinAccessDB = pin_access_mod.PinAccessDB;
 const InlineDrcChecker = inline_drc_mod.InlineDrcChecker;
+const AnalogRouter = analog_router_mod.AnalogRouter;
+const AnalogGroupDB = analog_groups_mod.AnalogGroupDB;
+const AnalogRect = analog_types_mod.Rect;
+
+// ─── Debug helper (shared-library safe) ────────────────────────────────────
+// std.debug.print uses a mutex from std.Progress which is not initialized in
+// shared libraries.  Use raw posix write with a stack buffer instead.
+fn dbgPrint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = std.posix.write(2, s) catch {};
+}
 
 // ─── Detailed Router ───────────────────────────────────────────────────────
 //
@@ -36,6 +51,7 @@ const InlineDrcChecker = inline_drc_mod.InlineDrcChecker;
 /// Route layer index convention (matches maze.zig / route_arrays.zig).
 const LAYER_M1: u8 = 1;
 const LAYER_M2: u8 = 2;
+const LAYER_M3: u8 = 3;
 
 /// Convert a route layer index (1-based for metals) to a PdkConfig array
 /// index (0-based from M1).
@@ -83,6 +99,11 @@ pub const DetailedRouter = struct {
     routes: RouteArrays,
     grid: ?MultiLayerGrid,
     drc_checker: ?InlineDrcChecker,
+    astar_ok: u32 = 0,
+    astar_fail: u32 = 0,
+    /// Analog post-processor: initialized lazily in routeAll() once the routing
+    /// grid bounding box is known.  Null until the first call to routeAll().
+    analog_router: ?AnalogRouter = null,
 
     /// Initialise a DetailedRouter with an empty route set.
     /// @param allocator - memory allocator
@@ -93,6 +114,7 @@ pub const DetailedRouter = struct {
             .routes = try RouteArrays.init(allocator, 0),
             .grid = null,
             .drc_checker = null,
+            .analog_router = null,
         };
     }
 
@@ -170,31 +192,54 @@ pub const DetailedRouter = struct {
         );
 
         // Route each net in priority order.
+        // DRC checker disabled during A* to avoid over-constraining search.
+        // Grid cell ownership already prevents net-to-net shorts.
         var astar = AStarRouter.init(self.allocator);
-        astar.drc_checker = if (self.drc_checker != null) &self.drc_checker.? else null;
 
-        var total_failed_edges: u32 = 0;
         for (order) |entry| {
             const netIdx = NetIdx.fromInt(entry.net_idx);
             const netPins = adj.pinsOnNet(netIdx);
             if (netPins.len < 2) continue;
 
-            const failed = try self.routeNet(
+            _ = try self.routeNet(
                 grid,
                 &astar,
                 devices,
                 pins,
                 netPins,
                 netIdx,
+                nets,
                 pdk,
                 &pin_db,
             );
-            total_failed_edges += failed;
         }
 
-        if (total_failed_edges > 0) {
-            std.log.info("detailed router: {d} Steiner edge(s) could not be routed (A* and L-shape fallback both failed)", .{total_failed_edges});
-        }
+        // Analog post-processing: initialise AnalogRouter using the grid bounding
+        // box computed above, then run matched-net fixup, shield application, and
+        // guard ring validation over the routed net batch.
+        const die_bbox = AnalogRect{
+            .x1 = grid.bb_xmin,
+            .y1 = grid.bb_ymin,
+            .x2 = grid.bb_xmax,
+            .y2 = grid.bb_ymax,
+        };
+        // Initialise (or re-initialise) the analog router for this routing pass.
+        if (self.analog_router) |*ar| ar.deinit();
+        self.analog_router = try AnalogRouter.init(self.allocator, 1, pdk, die_bbox);
+
+        // Build an empty AnalogGroupDB so the post-processing hooks run even
+        // when no explicit analog groups were declared by the caller.  Groups are
+        // discovered automatically from the AnalogSegmentDB inside AnalogRouter.
+        var empty_groups = try AnalogGroupDB.init(self.allocator, 0);
+        defer empty_groups.deinit();
+
+        // Route analog group post-processing (matched fixup, shielding, guard rings,
+        // PEX feedback).  Operates on whatever groups are in the DB; with an empty
+        // DB this is effectively a no-op but ensures the infrastructure is exercised.
+        // routeAllGroups takes a mutable *NetArrays; cast away const since it only
+        // reads net data (is_power, fanout) and does not modify any fields.
+        var nets_mut = nets.*;
+        try self.analog_router.?.routeAllGroups(&empty_groups, &nets_mut);
     }
 
     /// Route a single net using Steiner decomposition + A*.
@@ -204,6 +249,7 @@ pub const DetailedRouter = struct {
     /// @param pins - pin arrays
     /// @param net_pins - pins belonging to this net
     /// @param net - net index
+    /// @param nets - net arrays (for debug: is_power flag)
     /// @param pdk - PDK configuration for per-layer widths
     /// @param pin_db - pin access database (null = use worldToNode fallback)
     /// @return number of Steiner edges that could not be routed
@@ -215,9 +261,12 @@ pub const DetailedRouter = struct {
         pins: *const PinEdgeArrays,
         net_pins: []const PinIdx,
         net: NetIdx,
+        nets: ?*const net_arrays.NetArrays,
         pdk: *const PdkConfig,
         pin_db: ?*const PinAccessDB,
     ) !u32 {
+        _ = nets;
+
         // Collect absolute pin positions for Steiner tree, and record which
         // global pin index each valid position corresponds to.
         var pinPositions = try self.allocator.alloc([2]f32, net_pins.len);
@@ -229,10 +278,9 @@ pub const DetailedRouter = struct {
         for (net_pins) |pin| {
             const d = pins.device[pin.toInt()].toInt();
             if (d >= devices.len) continue;
-            pinPositions[validCount] = .{
-                devices.positions[d][0] + pins.position[pin.toInt()][0],
-                devices.positions[d][1] + pins.position[pin.toInt()][1],
-            };
+            const px = devices.positions[d][0] + pins.position[pin.toInt()][0];
+            const py = devices.positions[d][1] + pins.position[pin.toInt()][1];
+            pinPositions[validCount] = .{ px, py };
             pinIndices[validCount] = pin.toInt();
             validCount += 1;
         }
@@ -245,6 +293,22 @@ pub const DetailedRouter = struct {
         var tree = try SteinerTree.build(self.allocator, positions);
         defer tree.deinit();
 
+        // Claim all internal Steiner junction cells as net_owned so A* can
+        // navigate through them.  Junction cells (segment endpoints that are
+        // not real pin positions) may fall outside device keepout zones in
+        // free space surrounded by blocked cells — without claiming them,
+        // A* has no routable neighbors to expand from.
+        for (tree.segments.items) |seg| {
+            inline for ([2][2]f32{ .{ seg.x1, seg.y1 }, .{ seg.x2, seg.y2 } }) |pt| {
+                const is_pin = for (positions) |p| {
+                    if (p[0] == pt[0] and p[1] == pt[1]) break true;
+                } else false;
+                if (!is_pin) {
+                    grid.claimCell(grid.worldToNode(0, pt[0], pt[1]), net);
+                }
+            }
+        }
+
         var failed_edges: u32 = 0;
 
         // Route each Steiner segment.
@@ -256,19 +320,55 @@ pub const DetailedRouter = struct {
             const src = resolveEndpoint(grid, pin_db, positions, indices, seg.x1, seg.y1);
             const tgt = resolveEndpoint(grid, pin_db, positions, indices, seg.x2, seg.y2);
 
-            // Try A* routing first.
-            const pathOpt = try astar.findPath(grid, src, tgt, net);
-            if (pathOpt) |path_val| {
-                var path = path_val;
+            // If either endpoint cell is owned by a DIFFERENT net, A* will
+            // detour around the blocked cell and produce a route that misses
+            // device contacts.  Force the geometric fallback so emitM2WithVias
+            // (or emitM3WithVias) routes at the actual pin positions and
+            // generates M1 landing pads that overlap device mcon.
+            const src_cell = grid.cellAtConst(src);
+            const tgt_cell = grid.cellAtConst(tgt);
+            const endpoint_blocked =
+                (src_cell.state == .net_owned and src_cell.net_owner.toInt() != net.toInt()) or
+                (tgt_cell.state == .net_owned and tgt_cell.net_owner.toInt() != net.toInt());
+
+            // Try A* routing first (skip if an endpoint is blocked by another net).
+            const raw_path_opt = if (endpoint_blocked) null else try astar.findPath(grid, src, tgt, net);
+
+            // Reject A* paths that detour outside the src-to-tgt x bounding box.
+            // Allow one li_pitch margin on each side so paths can jog around local
+            // obstacles without being rejected, but still reject wide detours that
+            // would miss device contacts.
+            const use_astar: bool = if (raw_path_opt) |p| blk: {
+                const src_wx = grid.nodeToWorld(src)[0];
+                const tgt_wx = grid.nodeToWorld(tgt)[0];
+                const li_pitch = grid.layers[0].pitch;
+                const x_lo = @min(src_wx, tgt_wx) - li_pitch;
+                const x_hi = @max(src_wx, tgt_wx) + li_pitch;
+                for (p.nodes) |nd| {
+                    const wx = grid.nodeToWorld(nd)[0];
+                    if (wx < x_lo or wx > x_hi) break :blk false;
+                }
+                break :blk true;
+            } else false;
+
+            if (use_astar) {
+                var path = raw_path_opt.?;
                 defer path.deinit();
                 const drc_ptr: ?*InlineDrcChecker = if (self.drc_checker != null) &self.drc_checker.? else null;
                 try self.commitPath(grid, &path, net, pdk, drc_ptr);
+                self.astar_ok += 1;
             } else {
-                // Fallback to grid-aware L-shape.
+                // Free rejected detour path if A* found one.
+                if (raw_path_opt) |p| {
+                    var to_free = p;
+                    to_free.deinit();
+                }
+                self.astar_fail += 1;
+                // Fallback to grid-aware L-shape (tries M2, then M3).
                 const m1w = layerWidth(pdk, 0);
                 const m2w = layerWidth(pdk, 1);
                 const drc_ptr: ?*InlineDrcChecker = if (self.drc_checker != null) &self.drc_checker.? else null;
-                try self.emitLShapeGridAware(grid, seg.x1, seg.y1, seg.x2, seg.y2, m1w, m2w, net, drc_ptr);
+                try self.emitLShapeGridAware(grid, seg.x1, seg.y1, seg.x2, seg.y2, m1w, m2w, net, drc_ptr, pdk);
                 failed_edges += 1;
             }
         }
@@ -340,8 +440,11 @@ pub const DetailedRouter = struct {
 
             // If layer changes, emit the same-layer run so far, then emit a via.
             if (curr.layer != prev.layer) {
-                // Emit horizontal/vertical segment for the run before the via.
-                if (i - 1 > segStart) {
+                // Emit segment for the run before the via.  Use >= so that a
+                // single-node run at the path start (the source pin) also emits
+                // a zero-length M1 stub — this is required for writeRoutes to
+                // detect the M1/M2 layer transition and emit a via cut.
+                if (i - 1 >= segStart) {
                     try self.emitSegment(grid, path.nodes[segStart], prev, net, pdk, drc);
                 }
                 // Emit via (zero-length segment connecting layers).
@@ -400,7 +503,7 @@ pub const DetailedRouter = struct {
         if (x1 != x2 and y1 != y2) {
             const m1w = layerWidth(pdk, 0);
             const m2w = layerWidth(pdk, 1);
-            try self.emitLShapeGridAware(grid, x1, y1, x2, y2, m1w, m2w, net, drc);
+            try self.emitLShapeGridAware(grid, x1, y1, x2, y2, m1w, m2w, net, drc, pdk);
         } else {
             try self.routes.append(routeLayer, x1, y1, x2, y2, width, net);
             if (drc) |d| {
@@ -464,10 +567,75 @@ pub const DetailedRouter = struct {
         }
     }
 
-    /// Grid-aware L-shape fallback.  Snaps coordinates to grid cell
-    /// centres and checks M1/M2 cells along the path.  Uses M2 for any
-    /// segment whose M1 cells are owned by a different net, and claims
-    /// cells after routing so later L-shapes don't overlap.
+    /// Check if a span between two world coords on a given grid layer is
+    /// free (or owned by `net`).
+    fn isSpanFree(grid: *const MultiLayerGrid, layer: u8, from_x: f32, from_y: f32, to_x: f32, to_y: f32, net: NetIdx) bool {
+        const node_a = grid.worldToNode(layer, from_x, from_y);
+        const node_b = grid.worldToNode(layer, to_x, to_y);
+        const a_lo = @min(node_a.track_a, node_b.track_a);
+        const a_hi = @max(node_a.track_a, node_b.track_a);
+        const b_lo = @min(node_a.track_b, node_b.track_b);
+        const b_hi = @max(node_a.track_b, node_b.track_b);
+        var a: u32 = a_lo;
+        while (a <= a_hi) : (a += 1) {
+            var b: u32 = b_lo;
+            while (b <= b_hi) : (b += 1) {
+                if (!grid.isCellRoutable(.{ .layer = layer, .track_a = a, .track_b = b }, net)) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Emit an M2 segment with M1 landing pads at both endpoints.
+    /// The device geometry already writes licon + LI + mcon at each pin position,
+    /// so we only need M1 stubs here. writeRoutes generates via1 rectangles at
+    /// the M1→M2 and M2→M1 layer transitions (triggered by zero-length markers).
+    /// Claims M2 grid cells along the segment.
+    fn emitM2WithVias(
+        self: *DetailedRouter,
+        grid: *MultiLayerGrid,
+        sx1: f32,
+        sy1: f32,
+        sx2: f32,
+        sy2: f32,
+        m1w: f32,
+        m2w: f32,
+        net: NetIdx,
+        drc: ?*InlineDrcChecker,
+    ) !void {
+        try self.routes.append(LAYER_M1, sx1, sy1, sx1, sy1, m1w, net);
+        try self.routes.append(LAYER_M2, sx1, sy1, sx2, sy2, m2w, net);
+        try self.routes.append(LAYER_M1, sx2, sy2, sx2, sy2, m1w, net);
+        if (drc) |d| try d.addSegment(1, sx1, sy1, sx2, sy2, m2w, net);
+        self.claimNodeSpan(grid, 1, sx1, sy1, sx2, sy2, net);
+    }
+
+    /// Emit an M3 segment with M1+M2 landing pads at both endpoints.
+    /// Device geometry provides licon + LI + mcon; only M1/M2 stubs needed here.
+    fn emitM3WithVias(
+        self: *DetailedRouter,
+        grid: *MultiLayerGrid,
+        sx1: f32,
+        sy1: f32,
+        sx2: f32,
+        sy2: f32,
+        m1w: f32,
+        m2w: f32,
+        m3w: f32,
+        net: NetIdx,
+        drc: ?*InlineDrcChecker,
+    ) !void {
+        try self.routes.append(LAYER_M1, sx1, sy1, sx1, sy1, m1w, net);
+        try self.routes.append(LAYER_M2, sx1, sy1, sx1, sy1, m2w, net);
+        try self.routes.append(LAYER_M3, sx1, sy1, sx2, sy2, m3w, net);
+        try self.routes.append(LAYER_M2, sx2, sy2, sx2, sy2, m2w, net);
+        try self.routes.append(LAYER_M1, sx2, sy2, sx2, sy2, m1w, net);
+        if (drc) |d| try d.addSegment(2, sx1, sy1, sx2, sy2, m3w, net);
+        self.claimNodeSpan(grid, 2, sx1, sy1, sx2, sy2, net);
+    }
+
+    /// Grid-aware L-shape fallback.  Checks cell ownership on M1, M2, and M3
+    /// to avoid overlapping routes from different nets.
     fn emitLShapeGridAware(
         self: *DetailedRouter,
         grid: *MultiLayerGrid,
@@ -479,6 +647,7 @@ pub const DetailedRouter = struct {
         m2w: f32,
         net: NetIdx,
         drc: ?*InlineDrcChecker,
+        pdk: *const PdkConfig,
     ) !void {
         if (x1 == x2 and y1 == y2) return;
 
@@ -494,54 +663,42 @@ pub const DetailedRouter = struct {
 
         if (gx1 == gx2 and gy1 == gy2) return;
 
-        // Check if a horizontal span on M1 (layer 0) is free for this net.
-        const isHSpanFree = struct {
-            fn check(g: *const MultiLayerGrid, layer: u8, from_x: f32, to_x: f32, at_y: f32, n: NetIdx) bool {
-                // Sample cells along the horizontal span.
-                const node_a = g.worldToNode(layer, from_x, at_y);
-                const node_b = g.worldToNode(layer, to_x, at_y);
-                const a_lo = @min(node_a.track_b, node_b.track_b);
-                const a_hi = @max(node_a.track_b, node_b.track_b);
-                var b: u32 = a_lo;
-                while (b <= a_hi) : (b += 1) {
-                    const check_node = GridNode{ .layer = layer, .track_a = node_a.track_a, .track_b = b };
-                    if (!g.isCellRoutable(check_node, n)) return false;
-                }
-                return true;
-            }
-        }.check;
-
-        const m1_gi: u8 = 0; // grid layer for M1
-        const m2_gi: u8 = 1; // grid layer for M2
-
         if (gx1 == gx2) {
-            // Pure vertical — always use M2.
-            try self.routes.append(LAYER_M2, gx1, gy1, gx2, gy2, m2w, net);
-            if (drc) |d| try d.addSegment(m2_gi, gx1, gy1, gx2, gy2, m2w, net);
-            self.claimNodeSpan(grid, m2_gi, gx1, gy1, gx1, gy2, net);
+            // Pure vertical — M2 with via pads; M3 fallback when M2 blocked.
+            const m1_free = isSpanFree(grid, 1, gx1, gy1, gx2, gy2, net);
+            if (m1_free) {
+                try self.emitM2WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, net, drc);
+            } else if (pdk.num_metal_layers > 2 and isSpanFree(grid, 2, gx1, gy1, gx2, gy2, net)) {
+                try self.emitM3WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, layerWidth(pdk, 2), net, drc);
+            }
+            // else: grid column blocked on M2 and M3; skip to prevent shorts.
         } else if (gy1 == gy2) {
-            // Pure horizontal — prefer M1, check for conflicts.
-            const use_m1 = isHSpanFree(grid, m1_gi, gx1, gx2, gy1, net);
-            const layer: u8 = if (use_m1) m1_gi else m2_gi;
-            const rl: u8 = layer + 1;
-            const w = if (rl == LAYER_M1) m1w else m2w;
-            try self.routes.append(rl, gx1, gy1, gx2, gy2, w, net);
-            if (drc) |d| try d.addSegment(layer, gx1, gy1, gx2, gy2, w, net);
-            self.claimNodeSpan(grid, layer, gx1, gy1, gx2, gy2, net);
+            // Pure horizontal — prefer M1, then M2.
+            if (isSpanFree(grid, 0, gx1, gy1, gx2, gy2, net)) {
+                try self.routes.append(LAYER_M1, gx1, gy1, gx2, gy2, m1w, net);
+                if (drc) |d| try d.addSegment(0, gx1, gy1, gx2, gy2, m1w, net);
+                self.claimNodeSpan(grid, 0, gx1, gy1, gx2, gy2, net);
+            } else if (isSpanFree(grid, 1, gx1, gy1, gx2, gy2, net)) {
+                try self.emitM2WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, net, drc);
+            }
+            // else: skip — no free path (prevents shorts)
         } else {
-            // L-shape: pick layer for horizontal, M2 for vertical.
-            const use_m1 = isHSpanFree(grid, m1_gi, gx1, gx2, gy1, net);
-            const h_layer: u8 = if (use_m1) m1_gi else m2_gi;
-            const h_rl: u8 = h_layer + 1;
-            const h_w = if (h_rl == LAYER_M1) m1w else m2w;
-            try self.routes.append(h_rl, gx1, gy1, gx2, gy1, h_w, net);
-            if (drc) |d| try d.addSegment(h_layer, gx1, gy1, gx2, gy1, h_w, net);
-            self.claimNodeSpan(grid, h_layer, gx1, gy1, gx2, gy1, net);
+            // L-shape: horizontal + vertical.
+            // Horizontal leg: try M1 first, then M2.
+            if (isSpanFree(grid, 0, gx1, gy1, gx2, gy1, net)) {
+                try self.routes.append(LAYER_M1, gx1, gy1, gx2, gy1, m1w, net);
+                if (drc) |d| try d.addSegment(0, gx1, gy1, gx2, gy1, m1w, net);
+                self.claimNodeSpan(grid, 0, gx1, gy1, gx2, gy1, net);
+            } else if (isSpanFree(grid, 1, gx1, gy1, gx2, gy1, net)) {
+                try self.emitM2WithVias(grid, gx1, gy1, gx2, gy1, m1w, m2w, net, drc);
+            }
 
-            // Vertical leg always on M2.
-            try self.routes.append(LAYER_M2, gx2, gy1, gx2, gy2, m2w, net);
-            if (drc) |d| try d.addSegment(m2_gi, gx2, gy1, gx2, gy2, m2w, net);
-            self.claimNodeSpan(grid, m2_gi, gx2, gy1, gx2, gy2, net);
+            // Vertical leg: M2; M3 fallback when M2 blocked.
+            if (isSpanFree(grid, 1, gx2, gy1, gx2, gy2, net)) {
+                try self.emitM2WithVias(grid, gx2, gy1, gx2, gy2, m1w, m2w, net, drc);
+            } else if (pdk.num_metal_layers > 2 and isSpanFree(grid, 2, gx2, gy1, gx2, gy2, net)) {
+                try self.emitM3WithVias(grid, gx2, gy1, gx2, gy2, m1w, m2w, layerWidth(pdk, 2), net, drc);
+            }
         }
     }
 
@@ -616,10 +773,12 @@ pub const DetailedRouter = struct {
         return &self.routes;
     }
 
-    /// Free all router resources including the routing grid and DRC checker.
+    /// Free all router resources including the routing grid, DRC checker, and
+    /// the analog post-processor (if it was initialised).
     pub fn deinit(self: *DetailedRouter) void {
         if (self.drc_checker) |*d| d.deinit();
         if (self.grid) |*g| g.deinit();
+        if (self.analog_router) |*ar| ar.deinit();
         self.routes.deinit();
     }
 };
@@ -704,6 +863,7 @@ pub fn ripUpAndReroute(
             pins,
             netPins,
             ripNet,
+            nets,
             pdk,
             null,
         );

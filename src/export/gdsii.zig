@@ -359,54 +359,56 @@ pub const GdsiiWriter = struct {
             // Without these pads the narrow route PATHs (min_width) give
             // zero enclosure and KLayout LVS extraction fails to recognise
             // the connection.
-            if (!is_zero_length) {
-                if (prev_layer_idx) |prev_idx| {
-                    if (prev_idx != route_layer_idx) {
-                        const lo = @min(prev_idx, route_layer_idx);
-                        const hi = @max(prev_idx, route_layer_idx);
-                        const via_layer = mapViaLayer(pdk.layers, prev_idx, route_layer_idx);
-                        if (via_layer.layer != 0 and hi - lo == 1) {
-                            // Via pair index: li↔M1 = 0, M1↔M2 = via_pair-1 …
-                            const via_pair: usize = if (lo == 0) 0 else @as(usize, lo) - 1;
+            // Via detection fires for ALL layer transitions, including zero-length
+            // transition markers. (Zero-length segments mark via positions emitted
+            // by commitPath; gating on !is_zero_length caused the second via of any
+            // M2/M3 segment to be silently dropped.)
+            if (prev_layer_idx) |prev_idx| {
+                if (prev_idx != route_layer_idx) {
+                    const lo = @min(prev_idx, route_layer_idx);
+                    const hi = @max(prev_idx, route_layer_idx);
+                    const via_layer = mapViaLayer(pdk.layers, prev_idx, route_layer_idx);
+                    if (via_layer.layer != 0 and hi - lo == 1) {
+                        // Via pair index: li↔M1 = 0, M1↔M2 = 1, M2↔M3 = 2 …
+                        const via_pair: usize = lo;
 
-                            // Use PDK-specified via cut size (not route width).
-                            const via_half: i32 = @intFromFloat(@round(pdk.via_width[via_pair] * scale * 0.5));
+                        // Use PDK-specified via cut size (not route width).
+                        const via_half: i32 = @intFromFloat(@round(pdk.via_width[via_pair] * scale * 0.5));
 
-                            const use_prev_end = (prev_idx > route_layer_idx);
-                            const vx: i32 = if (use_prev_end)
-                                @intFromFloat(@round(routes.x2[i - 1] * scale))
-                            else
-                                @intFromFloat(@round(routes.x1[i] * scale));
-                            const vy: i32 = if (use_prev_end)
-                                @intFromFloat(@round(routes.y2[i - 1] * scale))
-                            else
-                                @intFromFloat(@round(routes.y1[i] * scale));
+                        const use_prev_end = (prev_idx > route_layer_idx);
+                        const vx: i32 = if (use_prev_end)
+                            @intFromFloat(@round(routes.x2[i - 1] * scale))
+                        else
+                            @intFromFloat(@round(routes.x1[i] * scale));
+                        const vy: i32 = if (use_prev_end)
+                            @intFromFloat(@round(routes.y2[i - 1] * scale))
+                        else
+                            @intFromFloat(@round(routes.y1[i] * scale));
 
-                            // Via cut rectangle.
-                            try writeRect(writer, via_layer, vx - via_half, vy - via_half, vx + via_half, vy + via_half);
+                        // Via cut rectangle.
+                        try writeRect(writer, via_layer, vx - via_half, vy - via_half, vx + via_half, vy + via_half);
 
-                            // Metal landing pads on both lower and upper metal
-                            // layers — ensure each metal encloses the via by
-                            // min_enclosure on each side (via_width + 2 *
-                            // min_enclosure).  Each pad must also satisfy the
-                            // layer's min_width rule, which can be larger than
-                            // the enclosure-derived size (e.g. M2 min_width =
-                            // 0.30µm vs via1 enclosure pad = 0.23µm).
-                            const enc: i32 = @intFromFloat(@round(pdk.min_enclosure[via_pair] * scale));
-                            const enc_pad_half: i32 = via_half + enc;
-                            const lower_layer = mapRouteLayer(pdk.layers, lo);
-                            const upper_layer = mapRouteLayer(pdk.layers, hi);
-                            // Each landing pad must be at least min_width/2 on its layer.
-                            // Convert route-layer indices to core PDK indices (0=M1).
-                            const lo_pdk = @as(usize, lo) -| 1;
-                            const hi_pdk = @as(usize, hi) -| 1;
-                            const lo_mw_half: i32 = @intFromFloat(@round(pdk.min_width[lo_pdk] * scale * 0.5));
-                            const hi_mw_half: i32 = @intFromFloat(@round(pdk.min_width[hi_pdk] * scale * 0.5));
-                            const lo_pad_half: i32 = @max(enc_pad_half, lo_mw_half);
-                            const hi_pad_half: i32 = @max(enc_pad_half, hi_mw_half);
-                            try writeRect(writer, lower_layer, vx - lo_pad_half, vy - lo_pad_half, vx + lo_pad_half, vy + lo_pad_half);
-                            try writeRect(writer, upper_layer, vx - hi_pad_half, vy - hi_pad_half, vx + hi_pad_half, vy + hi_pad_half);
-                        }
+                        // Metal landing pads on both lower and upper metal
+                        // layers — ensure each metal encloses the via by
+                        // min_enclosure on each side (via_width + 2 *
+                        // min_enclosure).  Each pad must also satisfy the
+                        // layer's min_width rule, which can be larger than
+                        // the enclosure-derived size (e.g. M2 min_width =
+                        // 0.30µm vs via1 enclosure pad = 0.23µm).
+                        const enc: i32 = @intFromFloat(@round(pdk.min_enclosure[via_pair] * scale));
+                        const enc_pad_half: i32 = via_half + enc;
+                        const lower_layer = mapRouteLayer(pdk.layers, lo);
+                        const upper_layer = mapRouteLayer(pdk.layers, hi);
+                        // Each landing pad must be at least min_width/2 on its layer.
+                        // Convert route-layer indices to core PDK indices (0=M1).
+                        const lo_pdk = @as(usize, lo) -| 1;
+                        const hi_pdk = @as(usize, hi) -| 1;
+                        const lo_mw_half: i32 = @intFromFloat(@round(pdk.min_width[lo_pdk] * scale * 0.5));
+                        const hi_mw_half: i32 = @intFromFloat(@round(pdk.min_width[hi_pdk] * scale * 0.5));
+                        const lo_pad_half: i32 = @max(enc_pad_half, lo_mw_half);
+                        const hi_pad_half: i32 = @max(enc_pad_half, hi_mw_half);
+                        try writeRect(writer, lower_layer, vx - lo_pad_half, vy - lo_pad_half, vx + lo_pad_half, vy + lo_pad_half);
+                        try writeRect(writer, upper_layer, vx - hi_pad_half, vy - hi_pad_half, vx + hi_pad_half, vy + hi_pad_half);
                     }
                 }
             }
@@ -701,6 +703,8 @@ fn writeMosfetGeometry(writer: anytype, layers: LayerTable, is_pmos: bool, x: i3
     // ── 8. Body / substrate tap ──
     // NMOS: p+ diffusion tap in p-substrate (PSDM implant)
     // PMOS: n+ diffusion tap in n-well (NSDM implant)
+    // x_tap = x (left edge of device), separate x-column from S/D contacts at cx.
+    const x_tap = x;
     const body_cy = y - eff_sd_ext - tap_gap - @divTrunc(tap_diff_size, 2);
     const tap_half = @divTrunc(tap_diff_size, 2);
 
@@ -708,23 +712,23 @@ fn writeMosfetGeometry(writer: anytype, layers: LayerTable, is_pmos: bool, x: i3
     // which is distinct from device diffusion (65/20).  KLayout LVS
     // recognises tap-layer shapes as substrate/well contacts.
     const tap_layer = if (layers.tap.layer != 0) layers.tap else layers.diff;
-    try writeRect(writer, tap_layer, cx - tap_half, body_cy - tap_half, cx + tap_half, body_cy + tap_half);
+    try writeRect(writer, tap_layer, x_tap - tap_half, body_cy - tap_half, x_tap + tap_half, body_cy + tap_half);
 
     // 8b. Body tap implant (PSDM for NMOS substrate, NSDM for PMOS well)
     const body_impl_layer = if (is_pmos) layers.nsdm else layers.psdm;
-    try writeRect(writer, body_impl_layer, cx - tap_half - implant_enc, body_cy - tap_half - implant_enc, cx + tap_half + implant_enc, body_cy + tap_half + implant_enc);
+    try writeRect(writer, body_impl_layer, x_tap - tap_half - implant_enc, body_cy - tap_half - implant_enc, x_tap + tap_half + implant_enc, body_cy + tap_half + implant_enc);
 
     // 8c. Body tap LICON
-    try writeRect(writer, layers.licon, cx - @divTrunc(licon_size, 2), body_cy - @divTrunc(licon_size, 2), cx + @divTrunc(licon_size, 2), body_cy + @divTrunc(licon_size, 2));
+    try writeRect(writer, layers.licon, x_tap - @divTrunc(licon_size, 2), body_cy - @divTrunc(licon_size, 2), x_tap + @divTrunc(licon_size, 2), body_cy + @divTrunc(licon_size, 2));
 
     // 8d. Body tap LI pad
-    try writeRect(writer, layers.li, cx - li_half, body_cy - li_half, cx + li_half, body_cy + li_half);
+    try writeRect(writer, layers.li, x_tap - li_half, body_cy - li_half, x_tap + li_half, body_cy + li_half);
 
     // 8e. Body tap MCON
-    try writeRect(writer, layers.mcon, cx - mcon_half, body_cy - mcon_half, cx + mcon_half, body_cy + mcon_half);
+    try writeRect(writer, layers.mcon, x_tap - mcon_half, body_cy - mcon_half, x_tap + mcon_half, body_cy + mcon_half);
 
     // 8f. Body tap M1 pad
-    try writeRect(writer, layers.metal[0], cx - m1_half, body_cy - m1_half, cx + m1_half, body_cy + m1_half);
+    try writeRect(writer, layers.metal[0], x_tap - m1_half, body_cy - m1_half, x_tap + m1_half, body_cy + m1_half);
 
     // ── 9. M1 pads over source/drain MCON (route landing area) ──
     try writeRect(writer, layers.metal[0], cx - m1_half, src_cy - m1_half, cx + m1_half, src_cy + m1_half);
@@ -833,17 +837,19 @@ fn writeMosfetGeometryFingered(
     try writeRect(writer, layers.mcon, gate_cx - mcon_half, gate_cy - mcon_half, gate_cx + mcon_half, gate_cy + mcon_half);
     try writeRect(writer, layers.metal[0], gate_cx - m1_half, gate_cy - m1_half, gate_cx + m1_half, gate_cy + m1_half);
 
+    // x_tap_f = x (left edge of device), separate x-column from S/D contacts at cx.
+    const x_tap_f = x;
     const body_cy = diff_y_min - tap_gap - @divTrunc(tap_diff_size, 2);
     const tap_half = @divTrunc(tap_diff_size, 2);
     const tap_layer = if (layers.tap.layer != 0) layers.tap else layers.diff;
-    try writeRect(writer, tap_layer, cx - tap_half, body_cy - tap_half, cx + tap_half, body_cy + tap_half);
+    try writeRect(writer, tap_layer, x_tap_f - tap_half, body_cy - tap_half, x_tap_f + tap_half, body_cy + tap_half);
 
     const body_impl_layer = if (is_pmos) layers.nsdm else layers.psdm;
-    try writeRect(writer, body_impl_layer, cx - tap_half - implant_enc, body_cy - tap_half - implant_enc, cx + tap_half + implant_enc, body_cy + tap_half + implant_enc);
-    try writeRect(writer, layers.licon, cx - @divTrunc(licon_size, 2), body_cy - @divTrunc(licon_size, 2), cx + @divTrunc(licon_size, 2), body_cy + @divTrunc(licon_size, 2));
-    try writeRect(writer, layers.li, cx - li_half, body_cy - li_half, cx + li_half, body_cy + li_half);
-    try writeRect(writer, layers.mcon, cx - mcon_half, body_cy - mcon_half, cx + mcon_half, body_cy + mcon_half);
-    try writeRect(writer, layers.metal[0], cx - m1_half, body_cy - m1_half, cx + m1_half, body_cy + m1_half);
+    try writeRect(writer, body_impl_layer, x_tap_f - tap_half - implant_enc, body_cy - tap_half - implant_enc, x_tap_f + tap_half + implant_enc, body_cy + tap_half + implant_enc);
+    try writeRect(writer, layers.licon, x_tap_f - @divTrunc(licon_size, 2), body_cy - @divTrunc(licon_size, 2), x_tap_f + @divTrunc(licon_size, 2), body_cy + @divTrunc(licon_size, 2));
+    try writeRect(writer, layers.li, x_tap_f - li_half, body_cy - li_half, x_tap_f + li_half, body_cy + li_half);
+    try writeRect(writer, layers.mcon, x_tap_f - mcon_half, body_cy - mcon_half, x_tap_f + mcon_half, body_cy + mcon_half);
+    try writeRect(writer, layers.metal[0], x_tap_f - m1_half, body_cy - m1_half, x_tap_f + m1_half, body_cy + m1_half);
 
     // NWELL for PMOS — emitted merged by writeDevices.
 

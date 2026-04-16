@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"nix develop .#test --command bash -c \\\"zig build -Doptimize=ReleaseFast 2>&1 | tail -1 && cp zig-out/lib/libspout.so python/libspout.so && python scripts/compare_drc.py -c current_mirror 2...",
-  "error": "Exit code 1\nwarning: Git tree '/home/omare/Documents/Projects/Active/Spout' is dirty\n================================================================================\nDRC EQUIVALENCE COMPARISON: Spout vs MAGIC\n================================================================================\nGoal: delta=0 means in-engine DRC matches MAGIC exactly\n\n  current_mirror ...  Spout=150, MAGIC=218, DELTA=-68 (68.8%)\n\n================================================================================\nCircuit  ...",
-  "timestamp": "2026-04-13T02:44:42.336Z",
-  "retry_count": 5
-}
