@@ -448,7 +448,8 @@ def run_pipeline(
                 raise RuntimeError(lvs_result["error"])
             lvs_clean = lvs_result["match"]
             if not lvs_clean:
-                sys.stdout.write(f"DEBUG LVS details:\n{lvs_result.get('details', '')[:3000]}\n")
+                # Full details (no truncation) so the failure diff is visible.
+                sys.stdout.write(f"DEBUG LVS details:\n{lvs_result.get('details', '')}\n")
                 sys.stdout.flush()
                 logger.warning("KLayout LVS FAILED — full output:\n%s", lvs_result.get("details", ""))
             logger.info("KLayout LVS: %s", "PASS" if lvs_clean else "FAIL")

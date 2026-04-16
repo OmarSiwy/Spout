@@ -162,11 +162,15 @@ pub const AStarRouter = struct {
             if (closed.contains(curKey)) continue;
             try closed.put(curKey, {});
 
-            // Goal reached?  Accept exact match or within 1 track on the
-            // target layer (handles grid quantization across layer vias).
-            if (current.node.eql(target) or self.isNearTarget(current.node, target)) {
-                // Always reconstruct to the canonical target so the returned
-                // path ends exactly at `target` regardless of isNearTarget.
+            // Goal reached — exact match only.  The `isNearTarget` relaxation
+            // was removed because reconstructPath used `curKey` for cameFrom
+            // traversal while forcing nodes[count-1] = target, which OMITS
+            // the near-target cell from the returned path and leaves a
+            // multi-track jump from the last predecessor to target.  That
+            // jump then forces commitPath to emit a long bridge wire that
+            // can cross over other devices and short them (observed on
+            // diff_pair tail net, y=11.532→12.072 bridged M2.drain pad).
+            if (current.node.eql(target)) {
                 return try self.reconstructPath(cameFrom, srcKey, curKey, source, target);
             }
 

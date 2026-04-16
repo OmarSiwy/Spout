@@ -45,8 +45,8 @@ fn dbgPrint(comptime fmt: []const u8, args: anytype) void {
 // ─── Detailed Router ───────────────────────────────────────────────────────
 //
 // Multi-pin net decomposition using Steiner tree topology, routed on a 3D
-// multi-layer grid via A*.  Nets are ordered: power nets first, then
-// ascending HPWL, high-fanout nets last.
+// multi-layer grid via A*.  Nets are ordered: signals first (ascending HPWL,
+// low fanout first), power nets last so they can detour around signals.
 
 /// Route layer index convention (matches maze.zig / route_arrays.zig).
 const LAYER_M1: u8 = 1;
@@ -77,14 +77,17 @@ const NetOrder = struct {
 };
 
 /// Compare function for net ordering:
-///   1. Power nets first.
+///   1. Signal nets first, power nets last (BUGS.md S1-8).  Power nets
+///      (VSS/VDD) have more pins and tolerate detours; routing them first
+///      caused them to grab M2/M3 columns that signals later need, leading
+///      to silent drops for short signal nets.  Signals go first so they
+///      claim the tight columns near device pins; power routes around them.
 ///   2. Ascending HPWL (shorter nets first — easier to route).
 ///   3. High-fanout nets last (they constrain more, route them after simpler nets).
 /// @return true if a should be routed before b
 fn netOrderLessThan(_: void, a: NetOrder, b: NetOrder) bool {
-    // Power nets have highest priority.
-    if (a.is_power and !b.is_power) return true;
-    if (!a.is_power and b.is_power) return false;
+    // Signals before power.
+    if (a.is_power != b.is_power) return !a.is_power;
 
     // Ascending HPWL.
     if (a.hpwl != b.hpwl) return a.hpwl < b.hpwl;
@@ -101,6 +104,13 @@ pub const DetailedRouter = struct {
     drc_checker: ?InlineDrcChecker,
     astar_ok: u32 = 0,
     astar_fail: u32 = 0,
+    /// Count of emitLShapeGridAware silent-drop branches (BUGS.md S0-1).
+    /// Each increment corresponds to a Steiner edge that could not be placed
+    /// because every candidate layer was blocked by a previously-routed net.
+    lshape_drop_vert: u32 = 0,
+    lshape_drop_horiz: u32 = 0,
+    lshape_drop_l_horiz: u32 = 0,
+    lshape_drop_l_vert: u32 = 0,
     /// Analog post-processor: initialized lazily in routeAll() once the routing
     /// grid bounding box is known.  Null until the first call to routeAll().
     analog_router: ?AnalogRouter = null,
@@ -240,6 +250,12 @@ pub const DetailedRouter = struct {
         // reads net data (is_power, fanout) and does not modify any fields.
         var nets_mut = nets.*;
         try self.analog_router.?.routeAllGroups(&empty_groups, &nets_mut);
+
+        // Router diagnostics (BUGS.md §4.4).
+        dbgPrint(
+            "ROUTER STATS: astar_ok={} astar_fail={} L-DROP vert={} horiz={} l_horiz={} l_vert={}\n",
+            .{ self.astar_ok, self.astar_fail, self.lshape_drop_vert, self.lshape_drop_horiz, self.lshape_drop_l_horiz, self.lshape_drop_l_vert },
+        );
     }
 
     /// Route a single net using Steiner decomposition + A*.
@@ -289,6 +305,44 @@ pub const DetailedRouter = struct {
         const positions = pinPositions[0..validCount];
         const indices = pinIndices[0..validCount];
 
+        // Pin-to-AP stitch (BUGS.md S1-5).  Device-layout emits its M1 pin pad
+        // centred at the physical pin (px, py); the router emits its M1 landing
+        // pad centred at the grid-snapped AP (ap.x, ap.y) via resolveEndpoint.
+        // When worldToNode snaps by more than (pad_half - device_pad_half), the
+        // two M1 rectangles do not overlap → net fragments → LVS fail.  Emit a
+        // short M1 L-shape from the physical pin to its center AP so the two
+        // pads are always geometrically connected.
+        if (pin_db) |db| {
+            const m1w = layerWidth(pdk, 0);
+            for (0..validCount) |ii| {
+                const pidx = indices[ii];
+                if (pidx >= db.aps.len) continue;
+                const pin_x = positions[ii][0];
+                const pin_y = positions[ii][1];
+                const aps = db.aps[pidx];
+                var center_ap: ?pin_access_mod.AccessPoint = null;
+                for (aps) |ap| {
+                    if (ap.cost == 0.0) {
+                        center_ap = ap;
+                        break;
+                    }
+                }
+                const ap = center_ap orelse continue;
+                dbgPrint(
+                    "STITCH net={} pidx={} pin=({d:.3},{d:.3}) ap=({d:.3},{d:.3}) ap_node_world=({d:.3},{d:.3})\n",
+                    .{ net.toInt(), pidx, pin_x, pin_y, ap.x, ap.y, grid.nodeToWorld(ap.node)[0], grid.nodeToWorld(ap.node)[1] },
+                );
+                if (pin_x == ap.x and pin_y == ap.y) continue;
+                if (pin_x == ap.x or pin_y == ap.y) {
+                    try self.routes.append(LAYER_M1, pin_x, pin_y, ap.x, ap.y, m1w, net);
+                } else {
+                    // L-shape: horizontal then vertical, both on M1.
+                    try self.routes.append(LAYER_M1, pin_x, pin_y, ap.x, pin_y, m1w, net);
+                    try self.routes.append(LAYER_M1, ap.x, pin_y, ap.x, ap.y, m1w, net);
+                }
+            }
+        }
+
         // Build Steiner tree to decompose multi-pin net into 2-pin segments.
         var tree = try SteinerTree.build(self.allocator, positions);
         defer tree.deinit();
@@ -319,6 +373,14 @@ pub const DetailedRouter = struct {
             // fall back to worldToNode for internal Steiner junction points.
             const src = resolveEndpoint(grid, pin_db, positions, indices, seg.x1, seg.y1);
             const tgt = resolveEndpoint(grid, pin_db, positions, indices, seg.x2, seg.y2);
+            {
+                const spos = grid.nodeToWorld(src);
+                const tpos = grid.nodeToWorld(tgt);
+                dbgPrint(
+                    "SEG net={} world=({d:.3},{d:.3})->({d:.3},{d:.3}) src_node=L{}(tA={},tB={},world={d:.3},{d:.3}) tgt_node=L{}(tA={},tB={},world={d:.3},{d:.3})\n",
+                    .{ net.toInt(), seg.x1, seg.y1, seg.x2, seg.y2, src.layer, src.track_a, src.track_b, spos[0], spos[1], tgt.layer, tgt.track_a, tgt.track_b, tpos[0], tpos[1] },
+                );
+            }
 
             // If either endpoint cell is owned by a DIFFERENT net, A* will
             // detour around the blocked cell and produce a route that misses
@@ -334,16 +396,22 @@ pub const DetailedRouter = struct {
             // Try A* routing first (skip if an endpoint is blocked by another net).
             const raw_path_opt = if (endpoint_blocked) null else try astar.findPath(grid, src, tgt, net);
 
-            // Reject A* paths that detour outside the src-to-tgt x bounding box.
-            // Allow one li_pitch margin on each side so paths can jog around local
-            // obstacles without being rejected, but still reject wide detours that
-            // would miss device contacts.
+            // Reject A* paths that detour far outside the src-to-tgt x bounding box.
+            // BUGS.md S1-2: a fixed one-pitch margin was too tight and forced
+            // needless fallbacks for legitimate routes that jog around blockages.
+            // Use an adaptive margin: max(li_pitch, 25% of HPWL).  This keeps
+            // short nets on a tight leash while letting longer nets detour
+            // proportionally.
             const use_astar: bool = if (raw_path_opt) |p| blk: {
                 const src_wx = grid.nodeToWorld(src)[0];
+                const src_wy = grid.nodeToWorld(src)[1];
                 const tgt_wx = grid.nodeToWorld(tgt)[0];
+                const tgt_wy = grid.nodeToWorld(tgt)[1];
                 const li_pitch = grid.layers[0].pitch;
-                const x_lo = @min(src_wx, tgt_wx) - li_pitch;
-                const x_hi = @max(src_wx, tgt_wx) + li_pitch;
+                const hpwl = @abs(tgt_wx - src_wx) + @abs(tgt_wy - src_wy);
+                const margin = @max(li_pitch, hpwl * 0.25);
+                const x_lo = @min(src_wx, tgt_wx) - margin;
+                const x_hi = @max(src_wx, tgt_wx) + margin;
                 for (p.nodes) |nd| {
                     const wx = grid.nodeToWorld(nd)[0];
                     if (wx < x_lo or wx > x_hi) break :blk false;
@@ -355,6 +423,12 @@ pub const DetailedRouter = struct {
                 var path = raw_path_opt.?;
                 defer path.deinit();
                 const drc_ptr: ?*InlineDrcChecker = if (self.drc_checker != null) &self.drc_checker.? else null;
+                if (net.toInt() == 7) {
+                    for (path.nodes, 0..) |pn, pi| {
+                        const pw = grid.nodeToWorld(pn);
+                        dbgPrint("  PATH[{}] L{} tA={} tB={} world=({d:.3},{d:.3})\n", .{ pi, pn.layer, pn.track_a, pn.track_b, pw[0], pw[1] });
+                    }
+                }
                 try self.commitPath(grid, &path, net, pdk, drc_ptr);
                 self.astar_ok += 1;
             } else {
@@ -451,6 +525,9 @@ pub const DetailedRouter = struct {
                 const pos = grid.nodeToWorld(prev);
                 const wx = pos[0];
                 const wy = pos[1];
+                const curr_pos = grid.nodeToWorld(curr);
+                const cx = curr_pos[0];
+                const cy = curr_pos[1];
                 const lowerLayer = @min(prev.layer, curr.layer);
                 const viaIdx: usize = @intCast(lowerLayer);
                 const viaWidth = if (viaIdx < pdk.num_metal_layers and pdk.via_width[viaIdx] > 0.0)
@@ -458,9 +535,37 @@ pub const DetailedRouter = struct {
                 else
                     @max(layerWidth(pdk, prev.layer), layerWidth(pdk, curr.layer));
                 try self.routes.append(lowerLayer + 1, wx, wy, wx, wy, viaWidth, net);
+                dbgPrint(
+                    "VIA net={} at ({d:.3},{d:.3}) layers={}->{}\n",
+                    .{ net.toInt(), wx, wy, prev.layer, curr.layer },
+                );
                 // Register via with DRC checker.
                 if (drc) |d| {
                     try d.addSegment(lowerLayer, wx, wy, wx, wy, viaWidth, net);
+                }
+                // Bridge segment: if the via landed at world(prev) but curr is
+                // on a different world position (A* via-with-offset, see
+                // astar.zig getNeighbors via-down offsets), emit a connecting
+                // wire on curr.layer from world(prev) to world(curr) so the
+                // landing pad overlaps curr's cell and net does not fragment.
+                if (wx != cx or wy != cy) {
+                    const bridgeLayer: u8 = curr.layer + 1;
+                    const bridgeWidth = layerWidth(pdk, curr.layer);
+                    if (wx == cx or wy == cy) {
+                        try self.routes.append(bridgeLayer, wx, wy, cx, cy, bridgeWidth, net);
+                        if (drc) |d| try d.addSegment(curr.layer, wx, wy, cx, cy, bridgeWidth, net);
+                    } else {
+                        try self.routes.append(bridgeLayer, wx, wy, cx, wy, bridgeWidth, net);
+                        try self.routes.append(bridgeLayer, cx, wy, cx, cy, bridgeWidth, net);
+                        if (drc) |d| {
+                            try d.addSegment(curr.layer, wx, wy, cx, wy, bridgeWidth, net);
+                            try d.addSegment(curr.layer, cx, wy, cx, cy, bridgeWidth, net);
+                        }
+                    }
+                    dbgPrint(
+                        "BRIDGE net={} L{} ({d:.3},{d:.3})->({d:.3},{d:.3})\n",
+                        .{ net.toInt(), curr.layer, wx, wy, cx, cy },
+                    );
                 }
                 segStart = i;
             } else if (i == path.nodes.len - 1) {
@@ -670,8 +775,11 @@ pub const DetailedRouter = struct {
                 try self.emitM2WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, net, drc);
             } else if (pdk.num_metal_layers > 2 and isSpanFree(grid, 2, gx1, gy1, gx2, gy2, net)) {
                 try self.emitM3WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, layerWidth(pdk, 2), net, drc);
+            } else {
+                // Silent drop: grid column blocked on M2 and M3.  Log + count.
+                self.lshape_drop_vert += 1;
+                dbgPrint("L-DROP vert net={} ({d:.3},{d:.3})->({d:.3},{d:.3})\n", .{ net.toInt(), gx1, gy1, gx2, gy2 });
             }
-            // else: grid column blocked on M2 and M3; skip to prevent shorts.
         } else if (gy1 == gy2) {
             // Pure horizontal — prefer M1, then M2.
             if (isSpanFree(grid, 0, gx1, gy1, gx2, gy2, net)) {
@@ -680,8 +788,10 @@ pub const DetailedRouter = struct {
                 self.claimNodeSpan(grid, 0, gx1, gy1, gx2, gy2, net);
             } else if (isSpanFree(grid, 1, gx1, gy1, gx2, gy2, net)) {
                 try self.emitM2WithVias(grid, gx1, gy1, gx2, gy2, m1w, m2w, net, drc);
+            } else {
+                self.lshape_drop_horiz += 1;
+                dbgPrint("L-DROP horiz net={} ({d:.3},{d:.3})->({d:.3},{d:.3})\n", .{ net.toInt(), gx1, gy1, gx2, gy2 });
             }
-            // else: skip — no free path (prevents shorts)
         } else {
             // L-shape: horizontal + vertical.
             // Horizontal leg: try M1 first, then M2.
@@ -691,6 +801,9 @@ pub const DetailedRouter = struct {
                 self.claimNodeSpan(grid, 0, gx1, gy1, gx2, gy1, net);
             } else if (isSpanFree(grid, 1, gx1, gy1, gx2, gy1, net)) {
                 try self.emitM2WithVias(grid, gx1, gy1, gx2, gy1, m1w, m2w, net, drc);
+            } else {
+                self.lshape_drop_l_horiz += 1;
+                dbgPrint("L-DROP l_horiz net={} ({d:.3},{d:.3})->({d:.3},{d:.3})\n", .{ net.toInt(), gx1, gy1, gx2, gy1 });
             }
 
             // Vertical leg: M2; M3 fallback when M2 blocked.
@@ -698,6 +811,9 @@ pub const DetailedRouter = struct {
                 try self.emitM2WithVias(grid, gx2, gy1, gx2, gy2, m1w, m2w, net, drc);
             } else if (pdk.num_metal_layers > 2 and isSpanFree(grid, 2, gx2, gy1, gx2, gy2, net)) {
                 try self.emitM3WithVias(grid, gx2, gy1, gx2, gy2, m1w, m2w, layerWidth(pdk, 2), net, drc);
+            } else {
+                self.lshape_drop_l_vert += 1;
+                dbgPrint("L-DROP l_vert net={} ({d:.3},{d:.3})->({d:.3},{d:.3})\n", .{ net.toInt(), gx2, gy1, gx2, gy2 });
             }
         }
     }
@@ -940,9 +1056,9 @@ test "netOrderLessThan priority" {
     const longNet = NetOrder{ .net_idx = 2, .is_power = false, .hpwl = 50.0, .fanout = 2 };
     const highFan = NetOrder{ .net_idx = 3, .is_power = false, .hpwl = 5.0, .fanout = 20 };
 
-    // Power nets first regardless of HPWL.
-    try std.testing.expect(netOrderLessThan({}, powerNet, shortNet));
-    try std.testing.expect(!netOrderLessThan({}, shortNet, powerNet));
+    // Signal nets first; power nets last (BUGS.md S1-8 reversal).
+    try std.testing.expect(netOrderLessThan({}, shortNet, powerNet));
+    try std.testing.expect(!netOrderLessThan({}, powerNet, shortNet));
 
     // Shorter HPWL first among non-power nets.
     try std.testing.expect(netOrderLessThan({}, shortNet, longNet));

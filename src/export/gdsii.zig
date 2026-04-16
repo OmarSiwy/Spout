@@ -401,9 +401,15 @@ pub const GdsiiWriter = struct {
                         const upper_layer = mapRouteLayer(pdk.layers, hi);
                         // Each landing pad must be at least min_width/2 on its layer.
                         // Convert route-layer indices to core PDK indices (0=M1).
+                        // BUGS.md S0-3: when lo==0 the lower layer is LI, whose
+                        // min_width (0.17 µm on sky130) differs from M1's (0.14 µm).
+                        // A saturating subtract gave the wrong pad size for LI.
                         const lo_pdk = @as(usize, lo) -| 1;
                         const hi_pdk = @as(usize, hi) -| 1;
-                        const lo_mw_half: i32 = @intFromFloat(@round(pdk.min_width[lo_pdk] * scale * 0.5));
+                        const lo_mw_half: i32 = if (lo == 0 and pdk.li_min_width > 0.0)
+                            @intFromFloat(@round(pdk.li_min_width * scale * 0.5))
+                        else
+                            @intFromFloat(@round(pdk.min_width[lo_pdk] * scale * 0.5));
                         const hi_mw_half: i32 = @intFromFloat(@round(pdk.min_width[hi_pdk] * scale * 0.5));
                         const lo_pad_half: i32 = @max(enc_pad_half, lo_mw_half);
                         const hi_pad_half: i32 = @max(enc_pad_half, hi_mw_half);
@@ -1182,6 +1188,13 @@ fn mapPinLayer(layers: LayerTable, idx: u8) GdsLayer {
     return .{ .layer = 0, .datatype = 0 };
 }
 
+/// Shared-library-safe debug print for export stage.
+fn dbgPrintExport(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = std.posix.write(2, s) catch {};
+}
+
 /// Iterate over route segments, and for each net place one TEXT label on
 /// the corresponding pin-purpose layer.  The label is placed at the
 /// midpoint of the first non-degenerate route segment found for that net.
@@ -1189,22 +1202,19 @@ fn mapPinLayer(layers: LayerTable, idx: u8) GdsLayer {
 /// This ensures KLayout LVS can identify each net by name.
 fn writeNetLabels(writer: anytype, routes: ?*const RouteArrays, pdk: *const PdkConfig, net_names: []const []const u8, pins: ?*const PinEdgeArrays, devices: *const DeviceArrays) !void {
     const scale: f32 = 1.0 / pdk.db_unit;
+    var label_count: u32 = 0;
 
-    // Track which nets have already been labelled (one label per net is
-    // sufficient for LVS).  Use a fixed bitset for up to 1024 nets;
-    // anything beyond is silently skipped (extremely rare in analog).
-    const max_nets = 1024;
-    var labelled = [_]bool{false} ** max_nets;
+    // Strategy: label EVERY non-degenerate route segment of every named net,
+    // AND label at EVERY device pin position.  Redundant labels are harmless
+    // for LVS (they all associate with the same geometric net), but this
+    // guarantees that if routing fragmented a net, every surviving fragment
+    // and every pin still carry the correct name.  See BUGS.md S0-2.
 
-    // Pass 1: label nets from route segments (preferred — label at midpoint
-    // of the first non-degenerate segment).  Skip entirely if routes is null.
+    // Pass 1: label every route segment.
     if (routes) |r| {
         const n: usize = @intCast(r.len);
         for (0..n) |i| {
             const net_idx = r.net[i].toInt();
-
-            if (net_idx >= max_nets) continue;
-            if (labelled[net_idx]) continue;
             if (net_idx >= net_names.len) continue;
             const name = net_names[net_idx];
             if (name.len == 0) continue;
@@ -1221,24 +1231,26 @@ fn writeNetLabels(writer: anytype, routes: ?*const RouteArrays, pdk: *const PdkC
 
             const pin_layer = mapPinLayer(pdk.layers, r.layer[i]);
             try writeTextElement(writer, pin_layer, mx, my, name);
-            labelled[net_idx] = true;
+            label_count += 1;
+            dbgPrintExport(
+                "  LABEL(seg) net='{s}' layer={}/{} pos=({},{}) route_layer={}\n",
+                .{ name, pin_layer.layer, pin_layer.datatype, mx, my, r.layer[i] },
+            );
         }
     }
 
-    // Pass 2: for nets that have no route segments (e.g. single-pin nets
-    // the router skipped), place a label at the device pin position on the
-    // LI pin-purpose layer (the lowest metal connected to the device).
+    // Pass 2: unconditionally label every named pin position on M1 pin layer.
+    // This ensures the pin is identified even when the router dropped the
+    // corresponding Steiner edge (silent drop → no route segment → no label
+    // from Pass 1).  KLayout tolerates duplicate labels on one electrical net.
     if (pins) |p| {
         const pn: usize = @intCast(p.len);
         for (0..pn) |i| {
             const net_idx = p.net[i].toInt();
-            if (net_idx >= max_nets) continue;
-            if (labelled[net_idx]) continue;
             if (net_idx >= net_names.len) continue;
             const name = net_names[net_idx];
             if (name.len == 0) continue;
 
-            // Absolute pin position = device centre + pin offset.
             const dev_idx = p.device[i].toInt();
             if (dev_idx >= devices.len) continue;
 
@@ -1247,13 +1259,17 @@ fn writeNetLabels(writer: anytype, routes: ?*const RouteArrays, pdk: *const PdkC
             const px: i32 = @intFromFloat(@round((dx + p.position[i][0]) * scale));
             const py: i32 = @intFromFloat(@round((dy + p.position[i][1]) * scale));
 
-            // Use M1 pin layer for device-level labels — matches device M1 pads
-            // so KLayout LVS can reliably associate labels with port connectivity.
             const pin_layer = pdk.layers.metal_pin[0];
             try writeTextElement(writer, pin_layer, px, py, name);
-            labelled[net_idx] = true;
+            label_count += 1;
+            dbgPrintExport(
+                "  LABEL(pin) net='{s}' layer={}/{} pos=({},{}) dev={} term={s}\n",
+                .{ name, pin_layer.layer, pin_layer.datatype, px, py, dev_idx, @tagName(p.terminal[i]) },
+            );
         }
     }
+
+    dbgPrintExport("LABELS EMITTED: {} total\n", .{label_count});
 }
 
 fn midpointI32(a: i32, b: i32) i32 {
@@ -1625,14 +1641,16 @@ test "mapPinLayer out of range returns zero" {
     try std.testing.expectEqual(@as(u16, 0), result.layer);
 }
 
-test "writeNetLabels places one label per net on the correct pin layer" {
+test "writeNetLabels places a label on every non-degenerate segment" {
+    // BUGS.md S0-2: labels are now emitted for every route segment so that
+    // fragmented nets survive LVS name-to-geometry association.
     // Set up 3 route segments: 2 for net 0 on layer 1 (M1), 1 for net 1 on layer 0 (LI).
     var routes = try RouteArrays.init(std.testing.allocator, 0);
     defer routes.deinit();
 
     // Net 0, layer 1 (M1), segment from (0,0) to (10,0)
     try routes.append(1, 0.0, 0.0, 10.0, 0.0, 0.14, NetIdx.fromInt(0));
-    // Net 0, layer 1 (M1), second segment — should NOT produce a second label
+    // Net 0, layer 1 (M1), second segment — now produces a second label.
     try routes.append(1, 10.0, 0.0, 10.0, 5.0, 0.14, NetIdx.fromInt(0));
     // Net 1, layer 0 (LI), segment from (0,0) to (5,0)
     try routes.append(0, 0.0, 0.0, 5.0, 0.0, 0.17, NetIdx.fromInt(1));
@@ -1653,21 +1671,24 @@ test "writeNetLabels places one label per net on the correct pin layer" {
 
     const written = fbs.getWritten();
 
-    // Should produce exactly 2 TEXT elements (one per net).
-    // "VDD" (3 chars, padded to 4): TEXT(4)+LAYER(6)+TEXTTYPE(6)+XY(12)+STRING(8)+ENDEL(4) = 40
-    // "VSS" (3 chars, padded to 4): same = 40
-    // Total = 80 bytes
-    try std.testing.expectEqual(@as(usize, 80), written.len);
+    // Expect 3 TEXT elements (one per segment).  Each label is 40 bytes:
+    // TEXT(4)+LAYER(6)+TEXTTYPE(6)+XY(12)+STRING(8)+ENDEL(4).
+    try std.testing.expectEqual(@as(usize, 120), written.len);
 
-    // Verify first TEXT is on MET1 pin layer (68, datatype 5)
-    try std.testing.expectEqual(@as(u8, 0x0C), written[2]); // TEXT record
-    try std.testing.expectEqual(@as(u8, 0x00), written[8]); // layer high byte
-    try std.testing.expectEqual(@as(u8, 0x44), written[9]); // layer 68
+    // First label (net 0, M1) → layer 68.
+    try std.testing.expectEqual(@as(u8, 0x0C), written[2]);
+    try std.testing.expectEqual(@as(u8, 0x00), written[8]);
+    try std.testing.expectEqual(@as(u8, 0x44), written[9]);
 
-    // Verify second TEXT is on LI pin layer (67, datatype 5)
-    try std.testing.expectEqual(@as(u8, 0x0C), written[42]); // TEXT record
-    try std.testing.expectEqual(@as(u8, 0x00), written[48]); // layer high byte
-    try std.testing.expectEqual(@as(u8, 0x43), written[49]); // layer 67
+    // Second label (net 0, M1) → layer 68.
+    try std.testing.expectEqual(@as(u8, 0x0C), written[42]);
+    try std.testing.expectEqual(@as(u8, 0x00), written[48]);
+    try std.testing.expectEqual(@as(u8, 0x44), written[49]);
+
+    // Third label (net 1, LI) → layer 67.
+    try std.testing.expectEqual(@as(u8, 0x0C), written[82]);
+    try std.testing.expectEqual(@as(u8, 0x00), written[88]);
+    try std.testing.expectEqual(@as(u8, 0x43), written[89]);
 }
 
 test "writeNetLabels skips degenerate zero-length segments" {

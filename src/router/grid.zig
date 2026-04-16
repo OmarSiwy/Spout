@@ -494,9 +494,12 @@ pub const MultiLayerGrid = struct {
             }
         }
 
-        // Pass 3: Un-block M1 cells at actual pin positions from PinEdgeArrays.
-        // This ensures the grid nodes that PinAccessDB / resolveEndpoint return
-        // are routable, even if hardcoded terminal offsets above don't match.
+        // Pass 3: Force pin-center ownership to each pin's own net.
+        // BUGS.md S1-1: Pass 2 un-blocking uses pinNetForTerminal which may
+        // attribute an overlap cell to the wrong net (last-writer-wins on
+        // keepout overlaps between adjacent terminals).  The pin center cell
+        // is authoritative — always write the pin's declared net here, even
+        // if Pass 2 already tagged it with a foreign net or left it blocked.
         if (pins) |pd| {
             const pin_len: usize = @intCast(pd.len);
             for (0..pin_len) |p| {
@@ -506,10 +509,8 @@ pub const MultiLayerGrid = struct {
                 const pin_y = devices.positions[d][1] + pd.position[p][1];
                 const node = self.worldToNode(0, pin_x, pin_y);
                 const cell = self.cellAt(node);
-                if (cell.state == .blocked) {
-                    cell.state = .net_owned;
-                    cell.net_owner = pd.net[p];
-                }
+                cell.state = .net_owned;
+                cell.net_owner = pd.net[p];
             }
         }
     }

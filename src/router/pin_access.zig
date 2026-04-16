@@ -98,13 +98,24 @@ pub const PinAccessDB = struct {
                 }
             }
 
-            // Filter: accept APs within 2x M1 pitch of pin center
+            // Filter: accept APs within 2x M1 pitch of pin center AND
+            // whose grid cell is routable.  BUGS.md S0-4: previously the
+            // center AP was assumed routable, allowing resolveEndpoint to
+            // return a `.blocked` node and force A* to fail immediately.
+            // Now: skip APs whose cell is `.blocked` or owned by another
+            // net (foreign owner = short risk).  Keep original cost ranking
+            // so the center (cost 0) is still preferred over alternates.
+            const my_net = pins.net[p];
             var valid: std.ArrayListUnmanaged(AccessPoint) = .{};
             for (candidates.items) |ap| {
                 const dist = @abs(ap.x - pin_x) + @abs(ap.y - pin_y);
-                if (dist < pdk.metal_pitch[0] * 2.0 + 0.01) {
-                    try valid.append(allocator, ap);
-                }
+                if (dist >= pdk.metal_pitch[0] * 2.0 + 0.01) continue;
+
+                const cell = grid.cellAtConst(ap.node);
+                if (cell.state == .blocked) continue;
+                if (cell.state == .net_owned and cell.net_owner.toInt() != my_net.toInt()) continue;
+
+                try valid.append(allocator, ap);
             }
 
             aps[p] = try valid.toOwnedSlice(allocator);
